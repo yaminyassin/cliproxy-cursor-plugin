@@ -23,10 +23,23 @@ import (
 const cursorBaseURL = "https://api2.cursor.sh"
 
 // defaultClientVersion is the compiled-in default for the
-// x-cursor-client-version header, sourced from gajae-code's
-// CURSOR_CLIENT_VERSION. It is overridable via the plugin's
-// x_cursor_client_version ConfigField (see internal/dispatch).
-const defaultClientVersion = "1.0.0"
+// x-cursor-client-version header, matching gajae-code's current
+// CURSOR_CLIENT_VERSION constant (packages/ai/src/providers/cursor/
+// client-version.ts) as of this writing. Cursor gates backend
+// features/minimum versions on this header, and the reference value
+// changes over time as Cursor ships new client releases - this constant
+// will drift and needs periodic re-syncing against the reference.
+//
+// KNOWN GAP: the x_cursor_client_version ConfigField is declared at
+// plugin.register (internal/dispatch/dispatch.go) for exactly this
+// reason, but plugin.reconfigure does not yet parse and apply it to the
+// running AgentClient - the SDK's public lifecycle request shape
+// (examples/plugin/simple/go/main.go's local lifecycleRequest struct)
+// does not expose a per-plugin config payload in this SDK version, so
+// wiring this safely needs either a newer SDK release or independent
+// verification of the host's actual reconfigure payload shape before
+// implementing it, rather than guessing at an unverified internal API.
+const defaultClientVersion = "cli-2026.02.13-41ac335"
 
 // newHTTP2Client builds an http.Client with HTTP/2 support forced over
 // TLS, matching gajae-code's http2.connect usage.
@@ -57,15 +70,24 @@ func (t *staticHeaderTransport) RoundTrip(req *http.Request) (*http.Response, er
 	req.Header.Set("x-cursor-client-version", version)
 	req.Header.Set("x-ghost-mode", "true")
 	req.Header.Set("x-cursor-client-type", "cli")
+	if req.Header.Get("x-request-id") == "" {
+		req.Header.Set("x-request-id", newRequestID())
+	}
 	return t.base.RoundTrip(req)
 }
 
 // AgentClient bundles the generated Connect-RPC client for
-// agent.v1.AgentService with the account store it authenticates against.
+// agent.v1.AgentService (used for simple unary calls like
+// GetUsableModels) with the raw HTTP client and base URL needed for the
+// real bidirectional Run exchange (stream.go), which cannot go through
+// the generated unary client - see stream.go's package doc for why.
 type AgentClient struct {
 	Service       genconnect.AgentServiceClient
 	Accounts      *account.Store
 	ClientVersion string
+
+	httpClient *http.Client
+	baseURL    string
 }
 
 // NewAgentClient builds an AgentClient pointed at Cursor's real backend.
@@ -94,6 +116,8 @@ func NewAgentClient(accounts *account.Store, httpClient *http.Client, baseURL, c
 		Service:       genconnect.NewAgentServiceClient(versioned, baseURL),
 		Accounts:      accounts,
 		ClientVersion: clientVersion,
+		httpClient:    versioned,
+		baseURL:       baseURL,
 	}
 }
 

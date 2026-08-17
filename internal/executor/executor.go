@@ -5,11 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"connectrpc.com/connect"
-
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-
-	"github.com/router-for-me/cliproxy-cursor-plugin/internal/cursorpb/gen"
 )
 
 const providerIdentifier = "cursor"
@@ -17,7 +13,9 @@ const providerIdentifier = "cursor"
 // Executor implements pluginapi.ProviderExecutor for Cursor: translates
 // chat-completions requests into Cursor AgentRunRequest calls and Cursor
 // responses back into chat-completions payloads, per the ralplan-approved
-// plan Section 5.
+// plan Section 5 and the terminal-critic-driven rework that replaced a
+// unary-only translation with the real bidirectional Run exchange (see
+// stream.go).
 type Executor struct {
 	client *AgentClient
 }
@@ -32,12 +30,11 @@ func (e *Executor) Identifier() string {
 	return providerIdentifier
 }
 
-// Execute implements pluginapi.ProviderExecutor: performs a single
-// non-streaming chat-completions call, translating to and from Cursor's
-// AgentRunRequest/AgentServerMessage. The Run RPC is unary in the
-// generated Connect client (see internal/cursorpb/README.md); this
-// executor buffers the full Cursor response before returning, matching
-// the plan's v1 tool-call buffering decision.
+// Execute implements pluginapi.ProviderExecutor: performs the full
+// bidirectional Run exchange (see stream.go), consuming every
+// InteractionUpdate until TurnEnded or stream close, and translates the
+// accumulated result into a single non-streaming chat-completions
+// response.
 func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
 	resp, errRun := e.run(ctx, req)
 	if errRun != nil {
@@ -50,15 +47,20 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 	return pluginapi.ExecutorResponse{Payload: payload}, nil
 }
 
-// ExecuteStream implements pluginapi.ProviderExecutor. v1 buffers the
-// full Cursor response and emits it as a single terminal chunk, honestly
-// reflecting that the generated Connect-RPC Run/RunSSE procedures are
-// unary calls (true low-level incremental multiplexed streaming requires
-// gajae-code's own hand-rolled raw HTTP/2 frame parsing, out of Option
-// A's codegen scope per the ADR) rather than pretending to stream
-// token-by-token. A mid-stream transport failure still surfaces a
+// ExecuteStream implements pluginapi.ProviderExecutor. The full Cursor
+// exchange (including its own internal multi-message/KV-blob handshake)
+// happens inside e.run before this returns; from the chat-completions
+// client's perspective this still delivers one buffered terminal chunk,
+// which is the documented v1 scope boundary for chat-completions-facing
+// incremental streaming (see docs/E2E.md) - the exchange with Cursor
+// itself is now the real bidirectional protocol, not a single unary
+// call, even though the client-facing surface remains buffered. A
+// mid-stream transport failure (the exchange with Cursor drops after
+// partial InteractionUpdates were already accumulated) still surfaces a
 // terminal chat-completions error chunk, never a silently truncated
-// success, per fact-r4/Principle 4.
+// success, per fact-r4/Principle 4 - see runCursorStream's error
+// handling in stream.go, which returns whatever was accumulated
+// alongside the error rather than discarding it.
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
 	chunks := make(chan pluginapi.ExecutorStreamChunk, 1)
 
@@ -98,7 +100,12 @@ func (e *Executor) HttpRequest(_ context.Context, _ pluginapi.ExecutorHTTPReques
 }
 
 // run performs the shared chat-completions -> Cursor -> chat-completions
-// translation used by both Execute and ExecuteStream.
+// translation used by both Execute and ExecuteStream: builds the
+// AgentRunRequest (registering every referenced blob in a fresh
+// per-request blobStore first, per stream.go's KV handshake
+// requirements), drives the real bidirectional exchange via
+// runCursorStream, and folds every accumulated InteractionUpdate into
+// the chat-completions response.
 func (e *Executor) run(ctx context.Context, req pluginapi.ExecutorRequest) (chatCompletionsResponse, error) {
 	var chatReq chatCompletionsRequest
 	if err := json.Unmarshal(req.Payload, &chatReq); err != nil {
@@ -113,23 +120,13 @@ func (e *Executor) run(ctx context.Context, req pluginapi.ExecutorRequest) (chat
 		return chatCompletionsResponse{}, fmt.Errorf("cursor: executor requires an active account: %w", err)
 	}
 
-	agentRunReq, err := buildAgentRunRequest(chatReq)
+	blobs := newBlobStore()
+	agentRunReq, err := buildAgentRunRequest(chatReq, blobs)
 	if err != nil {
 		return chatCompletionsResponse{}, fmt.Errorf("cursor: failed to build agent run request: %w", err)
 	}
 
-	// Run's RPC input is AgentClientMessage, whose oneof wraps the
-	// concrete AgentRunRequest payload (see AgentClientMessage_RunRequest
-	// in internal/cursorpb/gen/agent.pb.go).
-	clientMessage := &gen.AgentClientMessage{
-		Message: &gen.AgentClientMessage_RunRequest{RunRequest: agentRunReq},
-	}
-	connectReq := withAuth(connect.NewRequest(clientMessage), accountState.AccessToken)
-
-	resp, errRun := e.client.Service.Run(ctx, connectReq)
-	if errRun != nil {
-		return chatCompletionsResponse{}, fmt.Errorf("cursor: agent run failed: %w", errRun)
-	}
+	streamResult, errStream := e.client.runCursorStream(ctx, e.client.baseURL, accountState.AccessToken, agentRunReq, blobs)
 
 	responseID, errID := newResponseID()
 	if errID != nil {
@@ -137,8 +134,25 @@ func (e *Executor) run(ctx context.Context, req pluginapi.ExecutorRequest) (chat
 	}
 
 	var acc responseAccumulator
-	if interactionUpdate := resp.Msg.GetInteractionUpdate(); interactionUpdate != nil {
-		acc.accumulate(interactionUpdate)
+	if streamResult != nil {
+		for _, update := range streamResult.updates {
+			acc.accumulate(update)
+		}
+	}
+
+	if errStream != nil {
+		if len(acc.toolCalls) == 0 && acc.text.Len() == 0 {
+			// Nothing was salvaged before the failure; surface it as a
+			// hard error rather than an empty success.
+			return chatCompletionsResponse{}, fmt.Errorf("cursor: agent run failed: %w", errStream)
+		}
+		// Partial content was accumulated before the exchange failed;
+		// return it with the terminal error attached rather than
+		// silently discarding what Cursor already sent, per the
+		// fail-loud / never-silently-truncate principle.
+		resp := acc.toChatCompletionsResponse(chatReq.Model, responseID)
+		resp.Error = &chatErrorInfo{Message: errStream.Error(), Type: "cursor_stream_error"}
+		return resp, nil
 	}
 
 	return acc.toChatCompletionsResponse(chatReq.Model, responseID), nil

@@ -7,30 +7,37 @@ account. Per the ralplan-approved plan's two-tier verification strategy
 has also been checked once against a **real** Cursor account through a
 **real** CLIProxyAPI instance. This document is that manual checklist.
 
-## Known v1 scope limitation: buffered, not incremental, streaming
+## Protocol implementation note (post-boundary-review rework)
 
-`executor.execute_stream` is implemented on top of Cursor's generated
-Connect-RPC `Run`/`RunSSE` client methods, both of which are **unary**
-RPCs in the codegen this plugin uses (see `internal/cursorpb/README.md`
-and the ADR in the approved plan) — Cursor's own low-level incremental
-multiplexed event stream (the way gajae-code itself consumes it) is built
-on hand-rolled raw HTTP/2 frame parsing outside this codegen path, which
-is explicitly out of scope for v1 per the plan's ADR.
+An initial implementation of the executor used connect-go's generated
+**unary** `Run` client. A terminal review verified against
+`../gajae-code/packages/ai/src/providers/cursor.ts` that Cursor's real
+`Run` exchange is **not** a simple request/response call: it is a
+bidirectional HTTP/2 stream where the server can send multiple top-level
+messages and can request the client to resolve content-addressed blob
+IDs mid-exchange (the `KvServerMessage`/`KvClientMessage`
+`getBlobArgs`/`setBlobArgs` handshake) before continuing. The unary-only
+implementation silently dropped conversation history, mis-encoded tool
+results, and only ever consumed the first server message.
 
-Concretely: **one `Run` call currently surfaces at most one
-`InteractionUpdate` from Cursor's response into the chat-completions
-reply.** For a Cursor turn that emits multiple discrete update events
-(for example, a text delta followed by a separate tool-call-completed
-event as distinct top-level `AgentServerMessage`s rather than one
-combined message), only the first captured update is translated; later
-updates in the same underlying Cursor response are not yet accumulated.
-The per-turn tool-call *batching* behavior itself (multiple tool calls
-arriving within a single `InteractionUpdate`) is fully implemented and
-tested (`TestResponseAccumulator_BatchesMultipleToolCallsIntoOneArray`).
-Step 4 below is the specific manual check for this boundary: if a real
-Cursor tool-using turn spans multiple top-level server messages, confirm
-whether this manifests as a truncated response in practice, and file a
-follow-up story to accumulate across `Run`'s full response if so.
+The executor (`internal/executor/stream.go`) now performs the real
+exchange: a genuine HTTP/2 duplex request, Cursor's own Connect streaming
+frame format, a content-addressed blob store
+(`internal/executor/blobstore.go`), and the `rootPromptMessagesJson`
+field (which is what Cursor's server actually reads to build the model
+prompt - `turns[]` is a UI-history view only). This is covered by tests
+using a real HTTP/2 test server (`h2c`), not a substituted unary mock -
+see `internal/executor/executor_test.go` and `stream_test.go`.
+
+**Known remaining gap:** `x_cursor_client_version` is declared as a
+plugin `ConfigField` (so the management UI can display/edit it), but
+`plugin.reconfigure` does not yet parse and apply a live override to the
+running client - the CLIProxyAPI SDK version this plugin builds against
+does not expose a per-plugin config payload in its public lifecycle
+request shape. The compiled-in default is kept in sync with gajae-code's
+`CURSOR_CLIENT_VERSION` at the time of writing
+(`internal/executor/client.go`), and should be re-verified/updated
+periodically, since Cursor gates backend features on this header.
 
 ## Prerequisites
 
@@ -90,6 +97,11 @@ Confirm:
   an error or empty response.
 - The response shape matches standard chat-completions (`choices[0]
   .message.content`).
+- If the exchange required a Cursor-initiated blob request (this can
+  happen depending on conversation length/complexity), confirm the
+  response still comes back successfully rather than hanging or erroring
+  — this validates the real KV handshake against Cursor's actual
+  backend, not just the local `h2c` test server.
 
 ### 4. Multi-turn tool-using conversation
 
@@ -105,20 +117,20 @@ Confirm:
   the plugin itself and not silently dropped.
 - Sending the tool result back as a `tool` role message in the next
   request is accepted and the conversation continues coherently (Cursor
-  produces a follow-up response that accounts for the tool result) — the
+  produces a follow-up response that accounts for the tool result) - the
   translation layer itself is unit-tested
-  (`TestBuildAgentRunRequest_ToolResultRoundTrip`), but this step
-  verifies Cursor's real backend actually accepts and acts on the
-  re-encoded tool result, which the mock cannot prove.
-- Watch specifically for the buffered-streaming limitation documented
-  above: if Cursor emits the tool call and a text response as separate
-  top-level messages within one turn, confirm whether both arrive in the
-  chat-completions response or only the first.
+  (`TestBuildAgentRunRequest_ToolResultRoundTrip`, which asserts the
+  actual result text decodes correctly at the right nested oneof depth,
+  e.g. `ShellResult.Success.Stdout`), but this step verifies Cursor's
+  real backend actually accepts and acts on the re-encoded tool result,
+  which no mock can prove.
+- Confirm the conversation genuinely uses prior turns as context (ask a
+  follow-up question that only makes sense with earlier context) - this
+  validates `rootPromptMessagesJson` is actually reaching Cursor's model
+  prompt construction, not just being present in the request.
 
 This validates fact-r5-tool-roundtrip end-to-end, beyond what the mocked
-tests can prove on their own (they verify the translation logic in
-isolation; this step verifies it against Cursor's real backend and a
-real downstream client).
+tests can prove on their own.
 
 ### 5. Force a refresh failure
 

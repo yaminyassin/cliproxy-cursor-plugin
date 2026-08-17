@@ -3,6 +3,7 @@ package executor
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -14,15 +15,24 @@ import (
 
 // buildAgentRunRequest translates a chat-completions request into a
 // Cursor AgentRunRequest. The last user message becomes the turn's
-// UserMessageAction text (the action Cursor is being asked to run next);
-// every prior message (system/assistant/tool history) is encoded into
-// ConversationState.Turns as serialized AgentConversationTurnStructure
-// blobs, per fact-r5-tool-roundtrip: a client-supplied tool-role message
-// is re-encoded back into the matching Cursor ToolCall variant's Result
-// field (found generically via reflection, mirroring the extraction
-// side in translate_response.go) so a multi-turn tool-using conversation
-// round-trips correctly, not just a single isolated turn.
-func buildAgentRunRequest(req chatCompletionsRequest) (*gen.AgentRunRequest, error) {
+// UserMessageAction text (the action Cursor is being asked to run next).
+//
+// Prior messages are encoded TWICE, matching gajae-code's own
+// buildGrpcRequest (packages/ai/src/providers/cursor.ts:2659-2667):
+//   - ConversationState.Turns: a blob-ID-per-entry UI-history view
+//     (buildConversationTurns equivalent).
+//   - ConversationState.RootPromptMessagesJson: blob IDs pointing to
+//     plain JSON {role, content} objects, which is what Cursor's server
+//     actually uses to build the model prompt (buildRootPromptMessagesJson
+//     equivalent). Turns alone are NOT sufficient for the model to see
+//     conversation history - this was a real defect found in boundary
+//     review and verified against the reference implementation.
+//
+// Every blob referenced by ID here must be pre-registered in the shared
+// blobStore (via blobs.put) BEFORE the Run request is sent, so an
+// eventual server-initiated getBlobArgs for that ID can be answered
+// immediately without a round trip - see stream.go's handleKvServerMessage.
+func buildAgentRunRequest(req chatCompletionsRequest, blobs *blobStore) (*gen.AgentRunRequest, error) {
 	if len(req.Messages) == 0 {
 		return nil, fmt.Errorf("cursor: at least one message is required")
 	}
@@ -50,41 +60,37 @@ func buildAgentRunRequest(req chatCompletionsRequest) (*gen.AgentRunRequest, err
 		},
 	}
 
-	turns, err := buildHistoryTurns(req.Messages[:lastUserIdx])
+	history := req.Messages[:lastUserIdx]
+
+	turns, err := buildHistoryTurnBlobIDs(history, blobs)
 	if err != nil {
-		return nil, fmt.Errorf("cursor: failed to encode conversation history: %w", err)
+		return nil, fmt.Errorf("cursor: failed to encode conversation history turns: %w", err)
+	}
+
+	rootPromptIDs, err := buildRootPromptMessageBlobIDs(history, blobs)
+	if err != nil {
+		return nil, fmt.Errorf("cursor: failed to encode root prompt messages: %w", err)
 	}
 
 	return &gen.AgentRunRequest{
-		ConversationState: &gen.ConversationStateStructure{Turns: turns},
-		Action:            action,
-		ModelDetails:      &gen.ModelDetails{ModelId: req.Model},
+		ConversationState: &gen.ConversationStateStructure{
+			Turns:                  turns,
+			RootPromptMessagesJson: rootPromptIDs,
+		},
+		Action:       action,
+		ModelDetails: &gen.ModelDetails{ModelId: req.Model},
 	}, nil
 }
 
-// buildHistoryTurns encodes every message before the current turn's user
-// message into serialized ConversationTurnStructure blobs.
-// ConversationStateStructure.Turns is a [][]byte field: Cursor's wire
-// contract stores turns as opaque serialized blobs, and
-// AgentConversationTurnStructure itself stores its UserMessage/Steps as
-// serialized []byte / [][]byte sub-blobs rather than typed submessages
-// (see the generated field tags in internal/cursorpb/gen/agent.pb.go).
-//
-// Tool-role messages are matched to the immediately preceding
-// assistant tool_calls entry by tool_call_id/id, and re-encoded into the
-// same Cursor ToolCall variant (found by name from the surfaced
-// tool_calls[].function.name, e.g. "shell_tool_call") with its generic
-// Result field populated from the client's tool-result content. Roles
-// this v1 does not have a Cursor-side representation for (system) are
-// folded into a synthetic user-authored turn rather than dropped
-// silently - see the inline comment below.
-func buildHistoryTurns(messages []chatMessage) ([][]byte, error) {
+// buildHistoryTurnBlobIDs encodes every history message into
+// ConversationState.Turns entries as blob IDs (not the serialized bytes
+// directly - Cursor resolves each turns[] entry, and each turn's
+// user_message/steps sub-entries, through the KvServerMessage
+// getBlobArgs handshake during the live exchange). This mirrors
+// gajae-code's buildConversationTurns and is the UI-side history view;
+// buildRootPromptMessageBlobIDs below is what actually reaches the model.
+func buildHistoryTurnBlobIDs(messages []chatMessage, blobs *blobStore) ([][]byte, error) {
 	var turns [][]byte
-
-	// Track the most recent assistant tool_calls by id, so a subsequent
-	// tool-role message can be matched back to the ToolCall variant name
-	// Execute originally surfaced (see translate_response.go's
-	// toChatToolCall, which puts the oneof field name in Function.Name).
 	pendingToolCallsByID := map[string]chatToolCall{}
 
 	for _, msg := range messages {
@@ -93,27 +99,31 @@ func buildHistoryTurns(messages []chatMessage) ([][]byte, error) {
 			if msg.Content == "" {
 				continue
 			}
-			turn, err := marshalUserTurn("[system] " + msg.Content)
+			turn, err := userTurnBlobID("[system] "+msg.Content, blobs)
 			if err != nil {
 				return nil, err
 			}
 			turns = append(turns, turn)
 
 		case "user":
-			turn, err := marshalUserTurn(msg.Content)
+			turn, err := userTurnBlobID(msg.Content, blobs)
 			if err != nil {
 				return nil, err
 			}
 			turns = append(turns, turn)
 
 		case "assistant":
-			steps := make([]*gen.ConversationStep, 0, 1+len(msg.ToolCalls))
+			var stepBlobIDs [][]byte
 			if msg.Content != "" {
-				steps = append(steps, &gen.ConversationStep{
+				stepBytes, err := proto.Marshal(&gen.ConversationStep{
 					Message: &gen.ConversationStep_AssistantMessage{
 						AssistantMessage: &gen.AssistantMessage{Text: msg.Content},
 					},
 				})
+				if err != nil {
+					return nil, err
+				}
+				stepBlobIDs = append(stepBlobIDs, blobs.put(stepBytes))
 			}
 			for _, tc := range msg.ToolCalls {
 				pendingToolCallsByID[tc.ID] = tc
@@ -121,11 +131,15 @@ func buildHistoryTurns(messages []chatMessage) ([][]byte, error) {
 				if err != nil {
 					return nil, err
 				}
-				steps = append(steps, &gen.ConversationStep{
+				stepBytes, err := proto.Marshal(&gen.ConversationStep{
 					Message: &gen.ConversationStep_ToolCall{ToolCall: toolCallMsg},
 				})
+				if err != nil {
+					return nil, err
+				}
+				stepBlobIDs = append(stepBlobIDs, blobs.put(stepBytes))
 			}
-			turn, err := marshalStepsTurn(steps)
+			turn, err := stepsTurnBlobID(stepBlobIDs, blobs)
 			if err != nil {
 				return nil, err
 			}
@@ -134,10 +148,7 @@ func buildHistoryTurns(messages []chatMessage) ([][]byte, error) {
 		case "tool":
 			original, ok := pendingToolCallsByID[msg.ToolCallID]
 			if !ok {
-				// No matching prior tool_calls entry to attach this
-				// result to; fold it into a plain user-visible turn
-				// rather than silently dropping the result content.
-				turn, err := marshalUserTurn("[tool result] " + msg.Content)
+				turn, err := userTurnBlobID("[tool result] "+msg.Content, blobs)
 				if err != nil {
 					return nil, err
 				}
@@ -148,9 +159,13 @@ func buildHistoryTurns(messages []chatMessage) ([][]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			turn, err := marshalStepsTurn([]*gen.ConversationStep{
-				{Message: &gen.ConversationStep_ToolCall{ToolCall: toolCallWithResult}},
+			stepBytes, err := proto.Marshal(&gen.ConversationStep{
+				Message: &gen.ConversationStep_ToolCall{ToolCall: toolCallWithResult},
 			})
+			if err != nil {
+				return nil, err
+			}
+			turn, err := stepsTurnBlobID([][]byte{blobs.put(stepBytes)}, blobs)
 			if err != nil {
 				return nil, err
 			}
@@ -162,31 +177,20 @@ func buildHistoryTurns(messages []chatMessage) ([][]byte, error) {
 	return turns, nil
 }
 
-// marshalUserTurn wraps plain text as a user-message-only conversation
-// turn.
-func marshalUserTurn(text string) ([]byte, error) {
+func userTurnBlobID(text string, blobs *blobStore) ([]byte, error) {
 	userMsgBytes, err := proto.Marshal(&gen.UserMessage{Text: text})
 	if err != nil {
 		return nil, fmt.Errorf("cursor: failed to marshal user message: %w", err)
 	}
-	return marshalTurnStructure(&gen.AgentConversationTurnStructure{UserMessage: userMsgBytes})
+	userMsgBlobID := blobs.put(userMsgBytes)
+	return turnStructureBlobID(&gen.AgentConversationTurnStructure{UserMessage: userMsgBlobID}, blobs)
 }
 
-// marshalStepsTurn wraps a set of conversation steps (assistant text
-// and/or tool calls) as a conversation turn.
-func marshalStepsTurn(steps []*gen.ConversationStep) ([]byte, error) {
-	stepBytes := make([][]byte, 0, len(steps))
-	for _, step := range steps {
-		raw, err := proto.Marshal(step)
-		if err != nil {
-			return nil, fmt.Errorf("cursor: failed to marshal conversation step: %w", err)
-		}
-		stepBytes = append(stepBytes, raw)
-	}
-	return marshalTurnStructure(&gen.AgentConversationTurnStructure{Steps: stepBytes})
+func stepsTurnBlobID(stepBlobIDs [][]byte, blobs *blobStore) ([]byte, error) {
+	return turnStructureBlobID(&gen.AgentConversationTurnStructure{Steps: stepBlobIDs}, blobs)
 }
 
-func marshalTurnStructure(turn *gen.AgentConversationTurnStructure) ([]byte, error) {
+func turnStructureBlobID(turn *gen.AgentConversationTurnStructure, blobs *blobStore) ([]byte, error) {
 	wrapped := &gen.ConversationTurnStructure{
 		Turn: &gen.ConversationTurnStructure_AgentConversationTurn{AgentConversationTurn: turn},
 	}
@@ -194,7 +198,65 @@ func marshalTurnStructure(turn *gen.AgentConversationTurnStructure) ([]byte, err
 	if err != nil {
 		return nil, fmt.Errorf("cursor: failed to marshal conversation turn: %w", err)
 	}
-	return raw, nil
+	return blobs.put(raw), nil
+}
+
+// rootPromptEntry is the plain-JSON shape gajae-code's
+// buildRootPromptMessagesJson pushes per history message (not protobuf -
+// Cursor's server parses root_prompt_messages_json blobs as JSON).
+type rootPromptEntry struct {
+	Role    string                  `json:"role"`
+	Content []rootPromptContentPart `json:"content"`
+}
+
+type rootPromptContentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// buildRootPromptMessageBlobIDs encodes every history message as a
+// JSON-blob entry in the field Cursor's server actually reads to build
+// the model prompt (root_prompt_messages_json), ported from gajae-code's
+// buildRootPromptMessagesJson. Tool-role messages are folded into a
+// user-role "[Tool Result]" entry, matching the reference's own
+// toolResultToText handling, since root_prompt_messages_json has no
+// dedicated tool-result shape.
+func buildRootPromptMessageBlobIDs(messages []chatMessage, blobs *blobStore) ([][]byte, error) {
+	var ids [][]byte
+	for _, msg := range messages {
+		var entry rootPromptEntry
+		switch msg.Role {
+		case "system":
+			if msg.Content == "" {
+				continue
+			}
+			entry = rootPromptEntry{Role: "user", Content: []rootPromptContentPart{{Type: "text", Text: "[System]\n" + msg.Content}}}
+		case "user":
+			if msg.Content == "" {
+				continue
+			}
+			entry = rootPromptEntry{Role: "user", Content: []rootPromptContentPart{{Type: "text", Text: msg.Content}}}
+		case "assistant":
+			if msg.Content == "" {
+				continue
+			}
+			entry = rootPromptEntry{Role: "assistant", Content: []rootPromptContentPart{{Type: "text", Text: msg.Content}}}
+		case "tool":
+			if msg.Content == "" {
+				continue
+			}
+			entry = rootPromptEntry{Role: "user", Content: []rootPromptContentPart{{Type: "text", Text: "[Tool Result]\n" + msg.Content}}}
+		default:
+			continue
+		}
+
+		raw, err := json.Marshal(entry)
+		if err != nil {
+			return nil, fmt.Errorf("cursor: failed to marshal root prompt entry: %w", err)
+		}
+		ids = append(ids, blobs.put(raw))
+	}
+	return ids, nil
 }
 
 // chatToolCallToToolCall reconstructs a Cursor ToolCall from a
@@ -208,10 +270,8 @@ func chatToolCallToToolCall(tc chatToolCall) (*gen.ToolCall, error) {
 }
 
 // chatToolCallToToolCallWithResult is the same reconstruction, plus
-// setting the concrete tool message's generic "result" field (found by
-// reflection, since every concrete tool type - ShellToolCall,
-// ReadToolCall, etc. - has its own typed Result field) from the client's
-// tool-role message content.
+// setting the concrete tool message's result field from the client's
+// tool-role message content, via setGenericResultField.
 func chatToolCallToToolCallWithResult(tc chatToolCall, resultContent string) (*gen.ToolCall, error) {
 	return buildToolCallFromNameAndArgs(tc.Function.Name, tc.Function.Arguments, resultContent)
 }
@@ -240,7 +300,7 @@ func buildToolCallFromNameAndArgs(fieldName, argsJSON, resultContent string) (*g
 	}
 
 	if resultContent != "" {
-		if err := setGenericResultField(concreteMsg, resultContent); err != nil {
+		if err := setGenericResultField(concreteMsg, resultContent, 0); err != nil {
 			return nil, fmt.Errorf("cursor: failed to set tool result for %s: %w", fieldName, err)
 		}
 	}
@@ -249,18 +309,30 @@ func buildToolCallFromNameAndArgs(fieldName, argsJSON, resultContent string) (*g
 	return toolCall, nil
 }
 
+// maxResultDescendDepth bounds the recursive oneof descent in
+// setGenericResultField, so a pathological/cyclic schema can never cause
+// unbounded recursion.
+const maxResultDescendDepth = 4
+
 // setGenericResultField finds the concrete tool message's "result" field
 // (e.g. ShellToolCall.Result *ShellResult) via reflection and populates
-// it from resultContent. Every concrete Cursor tool type has its own
-// typed *XxxResult message with a "success"/text-shaped field; rather
-// than hand-writing all 30, this sets whichever singular string-ish
-// field exists first on the result message (matching gajae-code's own
-// pattern of representing tool results primarily as text - see
-// toolResultToText in providers/cursor.ts). If no result field exists on
-// this tool type, the result content is dropped from the wire but the
-// tool_call step itself is still recorded, which is a documented v1
-// scope limitation, not a silent failure of the surrounding call.
-func setGenericResultField(concreteMsg protoreflect.Message, resultContent string) error {
+// it with resultContent. Many Cursor result types (confirmed for
+// ShellResult) are themselves a oneof of outcome variants (Success/
+// Failure/Timeout/Rejected/...) with no top-level string field - the
+// actual text lives one level deeper (e.g. ShellSuccess.Command,
+// ShellSuccess.WorkingDirectory are typed fields, but the general pattern
+// across Cursor's tool results is a nested oneof holding the descriptive
+// message). This walks: result field -> if it has its own oneof, pick a
+// "success"-named case when present (falling back to the first declared
+// case otherwise) and descend into it -> set the first string field
+// found at that level. This generically reaches the actual text payload
+// instead of silently writing into an empty top-level wrapper, which was
+// the terminal-critic-verified defect in the previous single-level
+// implementation.
+func setGenericResultField(concreteMsg protoreflect.Message, resultContent string, depth int) error {
+	if depth >= maxResultDescendDepth {
+		return nil
+	}
 	fields := concreteMsg.Descriptor().Fields()
 	for i := 0; i < fields.Len(); i++ {
 		field := fields.Get(i)
@@ -271,7 +343,7 @@ func setGenericResultField(concreteMsg protoreflect.Message, resultContent strin
 			continue
 		}
 		resultMsg := concreteMsg.NewField(field).Message()
-		if err := setFirstStringField(resultMsg, resultContent); err != nil {
+		if err := populateResultMessage(resultMsg, resultContent, depth+1); err != nil {
 			return err
 		}
 		concreteMsg.Set(field, protoreflect.ValueOfMessage(resultMsg))
@@ -280,8 +352,94 @@ func setGenericResultField(concreteMsg protoreflect.Message, resultContent strin
 	return nil
 }
 
+// populateResultMessage writes resultContent into the given message: if
+// the message declares its own oneof (e.g. ShellResult's Success/
+// Failure/... outcome oneof), it selects a case (preferring one named
+// "success") and recurses into that case's concrete message; otherwise
+// it sets the first plain string field found directly on this message.
+func populateResultMessage(msg protoreflect.Message, resultContent string, depth int) error {
+	if depth >= maxResultDescendDepth {
+		return nil
+	}
+
+	oneofDesc := firstRealOneof(msg.Descriptor())
+	if oneofDesc != nil {
+		fields := oneofDesc.Fields()
+		if fields.Len() == 0 {
+			return nil
+		}
+
+		var chosen protoreflect.FieldDescriptor
+		for i := 0; i < fields.Len(); i++ {
+			f := fields.Get(i)
+			if string(f.Name()) == "success" {
+				chosen = f
+				break
+			}
+		}
+		if chosen == nil {
+			chosen = fields.Get(0)
+		}
+		if chosen.Message() == nil {
+			return nil
+		}
+
+		caseMsg := msg.NewField(chosen).Message()
+		if err := populateResultMessage(caseMsg, resultContent, depth+1); err != nil {
+			return err
+		}
+		msg.Set(chosen, protoreflect.ValueOfMessage(caseMsg))
+		return nil
+	}
+
+	return setFirstStringField(msg, resultContent)
+}
+
+// firstRealOneof returns the first genuinely-declared oneof on a message
+// descriptor (e.g. ShellResult's Success/Failure/Timeout/Rejected/...
+// outcome oneof), skipping proto3 "optional" fields' synthetic
+// single-field oneofs. Proto3 represents every `optional` scalar field
+// as its own one-field oneof under the hood; naively picking
+// Oneofs().Get(0) can land on one of those synthetic oneofs (e.g.
+// ShellResult.sandbox_policy) instead of the real outcome oneof,
+// silently mis-selecting a field with no content - this was the root
+// cause of a failing round-trip test caught during rework.
+func firstRealOneof(desc protoreflect.MessageDescriptor) protoreflect.OneofDescriptor {
+	oneofs := desc.Oneofs()
+	for i := 0; i < oneofs.Len(); i++ {
+		od := oneofs.Get(i)
+		if !od.IsSynthetic() {
+			return od
+		}
+	}
+	return nil
+}
+
+// preferredResultFieldNames lists field names checked in priority order
+// before falling back to "the first string field declared". Cursor's
+// concrete result types (ShellSuccess, ReadLintsToolResult, etc.) often
+// declare an identifying field (e.g. ShellSuccess.Command) before the
+// actual content field (ShellSuccess.Stdout); a naive "first string
+// field" pick lands on the identifying field, not the content, which was
+// part of the terminal-critic-verified silent-drop defect. Checking
+// common content-bearing names first fixes the confirmed ShellResult
+// case and generalizes reasonably to the other tool result types without
+// hand-writing all 30.
+var preferredResultFieldNames = []string{"stdout", "output", "content", "text", "result", "message", "body"}
+
 func setFirstStringField(msg protoreflect.Message, value string) error {
 	fields := msg.Descriptor().Fields()
+
+	for _, preferred := range preferredResultFieldNames {
+		for i := 0; i < fields.Len(); i++ {
+			field := fields.Get(i)
+			if field.Kind() == protoreflect.StringKind && string(field.Name()) == preferred {
+				msg.Set(field, protoreflect.ValueOfString(value))
+				return nil
+			}
+		}
+	}
+
 	for i := 0; i < fields.Len(); i++ {
 		field := fields.Get(i)
 		if field.Kind() == protoreflect.StringKind {
