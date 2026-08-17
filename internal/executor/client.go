@@ -8,6 +8,7 @@ package executor
 
 import (
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -28,17 +29,12 @@ const cursorBaseURL = "https://api2.cursor.sh"
 // client-version.ts) as of this writing. Cursor gates backend
 // features/minimum versions on this header, and the reference value
 // changes over time as Cursor ships new client releases - this constant
-// will drift and needs periodic re-syncing against the reference.
-//
-// KNOWN GAP: the x_cursor_client_version ConfigField is declared at
-// plugin.register (internal/dispatch/dispatch.go) for exactly this
-// reason, but plugin.reconfigure does not yet parse and apply it to the
-// running AgentClient - the SDK's public lifecycle request shape
-// (examples/plugin/simple/go/main.go's local lifecycleRequest struct)
-// does not expose a per-plugin config payload in this SDK version, so
-// wiring this safely needs either a newer SDK release or independent
-// verification of the host's actual reconfigure payload shape before
-// implementing it, rather than guessing at an unverified internal API.
+// will drift and needs periodic re-syncing against the reference. The
+// x_cursor_client_version ConfigField (declared at plugin.register in
+// internal/dispatch/dispatch.go) can override this at runtime via
+// plugin.reconfigure's config_yaml payload - see
+// (*AgentClient).SetClientVersion and internal/dispatch's
+// applyConfigYAML.
 const defaultClientVersion = "cli-2026.02.13-41ac335"
 
 // newHTTP2Client builds an http.Client with HTTP/2 support forced over
@@ -56,14 +52,20 @@ func newHTTP2Client() *http.Client {
 // x-cursor-client-type), ported from gajae-code's buildRequestHeaders.
 // Per-account bearer auth is set per-call via Connect request headers
 // instead (see withAuth below), since it varies by account.
+//
+// clientVersion is an *atomic.Value (not a plain string) so
+// plugin.reconfigure can update it concurrently with in-flight requests
+// safely (see (*AgentClient).SetClientVersion) - the whole point of
+// wiring the x_cursor_client_version ConfigField is a live override
+// without requiring a plugin restart.
 type staticHeaderTransport struct {
 	base          http.RoundTripper
-	clientVersion string
+	clientVersion *atomic.Value
 }
 
 func (t *staticHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
-	version := t.clientVersion
+	version, _ := t.clientVersion.Load().(string)
 	if version == "" {
 		version = defaultClientVersion
 	}
@@ -82,9 +84,10 @@ func (t *staticHeaderTransport) RoundTrip(req *http.Request) (*http.Response, er
 // real bidirectional Run exchange (stream.go), which cannot go through
 // the generated unary client - see stream.go's package doc for why.
 type AgentClient struct {
-	Service       genconnect.AgentServiceClient
-	Accounts      *account.Store
-	ClientVersion string
+	Service  genconnect.AgentServiceClient
+	Accounts *account.Store
+
+	clientVersion *atomic.Value
 
 	httpClient *http.Client
 	baseURL    string
@@ -92,7 +95,8 @@ type AgentClient struct {
 
 // NewAgentClient builds an AgentClient pointed at Cursor's real backend.
 // httpClient may be overridden by tests; clientVersion overrides the
-// compiled-in default x-cursor-client-version when non-empty.
+// compiled-in default x-cursor-client-version when non-empty (this is
+// the initial value only - see SetClientVersion for live updates).
 func NewAgentClient(accounts *account.Store, httpClient *http.Client, baseURL, clientVersion string) *AgentClient {
 	if httpClient == nil {
 		httpClient = newHTTP2Client()
@@ -104,21 +108,60 @@ func NewAgentClient(accounts *account.Store, httpClient *http.Client, baseURL, c
 	if base == nil {
 		base = http.DefaultTransport
 	}
+
+	versionHolder := &atomic.Value{}
+	versionHolder.Store(clientVersion)
+
 	versioned := &http.Client{
 		Timeout: httpClient.Timeout,
 		Transport: &staticHeaderTransport{
 			base:          base,
-			clientVersion: clientVersion,
+			clientVersion: versionHolder,
 		},
 	}
 
 	return &AgentClient{
 		Service:       genconnect.NewAgentServiceClient(versioned, baseURL),
 		Accounts:      accounts,
-		ClientVersion: clientVersion,
+		clientVersion: versionHolder,
 		httpClient:    versioned,
 		baseURL:       baseURL,
 	}
+}
+
+// SetClientVersion updates the x-cursor-client-version header applied to
+// every subsequent request (both the raw streaming Run path and the
+// generated unary GetUsableModels path, since both share this
+// AgentClient's httpClient/transport). Safe to call concurrently with
+// in-flight requests. Called from internal/dispatch's
+// plugin.reconfigure handler when config_yaml declares
+// x_cursor_client_version.
+func (c *AgentClient) SetClientVersion(version string) {
+	c.clientVersion.Store(version)
+}
+
+// ClientVersion returns the currently configured client version override
+// (empty string means "use defaultClientVersion").
+func (c *AgentClient) ClientVersion() string {
+	v, _ := c.clientVersion.Load().(string)
+	return v
+}
+
+func (c *AgentClient) clientVersionOrDefault() string {
+	v := c.ClientVersion()
+	if v == "" {
+		return defaultClientVersion
+	}
+	return v
+}
+
+// HTTPClient returns the underlying http.Client whose transport applies
+// this AgentClient's current header set (including any live
+// x-cursor-client-version override). Exposed primarily so tests can
+// verify header behavior end-to-end against a real HTTP server without
+// duplicating the transport wiring.
+func (c *AgentClient) HTTPClient() *http.Client {
+	return c.httpClient
 }
 
 // withAuth sets the per-account Bearer authorization header on a Connect

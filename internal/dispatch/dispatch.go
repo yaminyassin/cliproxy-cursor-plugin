@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 
@@ -85,6 +87,7 @@ func HandleMethod(method string, request []byte) ([]byte, error) {
 
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		applyLifecycleConfig(request)
 		return okEnvelope(currentRegistration())
 
 	case pluginabi.MethodAuthIdentifier:
@@ -301,4 +304,64 @@ func errorEnvelope(code, message string) []byte {
 // explicit typed error, never a silent empty success.
 func notImplementedEnvelope(method string) []byte {
 	return errorEnvelope("not_implemented", fmt.Sprintf("%s is not yet implemented (scheduled in a later story)", method))
+}
+
+// rpcLifecycleRequest mirrors the host's own lifecycle request shape
+// (internal/pluginhost/rpc_schema.go's rpcLifecycleRequest in the
+// downloaded github.com/router-for-me/CLIProxyAPI/v7 module, confirmed
+// by inspecting the real SDK dependency directly): the host sends
+// {"config_yaml": <bytes>, "schema_version": N} as the request body for
+// both plugin.register and plugin.reconfigure. ConfigYAML holds the raw
+// YAML bytes of this plugin's plugins.configs.<pluginID> block.
+type rpcLifecycleRequest struct {
+	ConfigYAML    []byte `json:"config_yaml"`
+	SchemaVersion uint32 `json:"schema_version"`
+}
+
+// pluginConfigYAML is the subset of plugins.configs.cursor's YAML shape
+// this plugin actually reads. Unknown keys are ignored by yaml.v3's
+// default unmarshal behavior.
+type pluginConfigYAML struct {
+	XCursorClientVersion string `yaml:"x_cursor_client_version"`
+}
+
+// applyLifecycleConfig parses plugin.register/plugin.reconfigure's
+// config_yaml payload (when present) and applies any recognized
+// override to the process-global agentClient, so the
+// x_cursor_client_version ConfigField declared in currentRegistration
+// has real runtime effect instead of being a display-only field.
+func applyLifecycleConfig(request []byte) {
+	applyLifecycleConfigTo(agentClient, request)
+}
+
+// clientVersionSetter is the minimal interface applyLifecycleConfigTo
+// needs from an AgentClient, letting tests inject a client pointed at a
+// local test server instead of mutating the process-global singleton.
+type clientVersionSetter interface {
+	SetClientVersion(version string)
+}
+
+// applyLifecycleConfigTo does the actual config_yaml parse-and-apply
+// work against the given client. A missing, empty, or unparsable payload
+// is not an error - register calls commonly precede any user
+// configuration, and this plugin has a reasonable compiled-in default
+// (see executor.defaultClientVersion).
+func applyLifecycleConfigTo(client clientVersionSetter, request []byte) {
+	if len(request) == 0 {
+		return
+	}
+	var lifecycle rpcLifecycleRequest
+	if err := json.Unmarshal(request, &lifecycle); err != nil {
+		return
+	}
+	if len(lifecycle.ConfigYAML) == 0 {
+		return
+	}
+	var cfg pluginConfigYAML
+	if err := yaml.Unmarshal(lifecycle.ConfigYAML, &cfg); err != nil {
+		return
+	}
+	if cfg.XCursorClientVersion != "" {
+		client.SetClientVersion(cfg.XCursorClientVersion)
+	}
 }

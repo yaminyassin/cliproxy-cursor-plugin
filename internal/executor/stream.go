@@ -121,7 +121,7 @@ func (c *AgentClient) runCursorStream(ctx context.Context, baseURL, accessToken 
 	httpReq.Header.Set("authorization", "Bearer "+accessToken)
 	httpReq.Header.Set("x-ghost-mode", "true")
 	httpReq.Header.Set("x-cursor-client-type", "cli")
-	httpReq.Header.Set("x-cursor-client-version", c.clientVersion())
+	httpReq.Header.Set("x-cursor-client-version", c.clientVersionOrDefault())
 	httpReq.Header.Set("x-request-id", newRequestID())
 
 	kv := &kvWriter{pw: pw}
@@ -202,11 +202,21 @@ func (c *AgentClient) runCursorStream(ctx context.Context, baseURL, accessToken 
 				if errKV := handleKvServerMessage(msg.KvServerMessage, blobs, kv); errKV != nil {
 					return result, fmt.Errorf("cursor: failed to answer KV handshake: %w", errKV)
 				}
+			case *gen.AgentServerMessage_ExecServerMessage:
+				// Cursor's live exec-request channel requires a
+				// synchronous reply on this same stream before it
+				// continues (see execmessage.go doc comment) - unlike
+				// the other default-branch cases below, silently
+				// ignoring this can hang the exchange.
+				if errExec := handleExecServerMessage(msg.ExecServerMessage, kv); errExec != nil {
+					return result, fmt.Errorf("cursor: failed to answer exec message: %w", errExec)
+				}
 			default:
-				// ConversationCheckpointUpdate/ExecServerMessage/
-				// ExecServerControlMessage/InteractionQuery: non-chat
-				// agent bookkeeping, safely ignored per the plan's
-				// documented scope boundary.
+				// ConversationCheckpointUpdate/ExecServerControlMessage/
+				// InteractionQuery: non-chat agent bookkeeping, safely
+				// ignored per the plan's documented scope boundary -
+				// these do not require a synchronous reply to avoid
+				// hanging the exchange (unlike ExecServerMessage above).
 			}
 		}
 
@@ -225,13 +235,6 @@ func (c *AgentClient) runCursorStream(ctx context.Context, baseURL, accessToken 
 			return result, fmt.Errorf("cursor: streaming run ended without a Connect end-of-stream frame (mid-stream drop): %w", errRead)
 		}
 	}
-}
-
-func (c *AgentClient) clientVersion() string {
-	if c.ClientVersion != "" {
-		return c.ClientVersion
-	}
-	return defaultClientVersion
 }
 
 func newRequestID() string {

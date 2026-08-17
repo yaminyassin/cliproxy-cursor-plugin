@@ -38,10 +38,12 @@ type fakeCursorRunServer struct {
 	server *httptest.Server
 	client *http.Client
 
-	scriptedUpdates     []*gen.InteractionUpdate
-	kvGetBlobIDs        [][]byte
-	receivedKVResponses [][]byte
-	failMidStream       bool
+	scriptedUpdates            []*gen.InteractionUpdate
+	kvGetBlobIDs               [][]byte
+	receivedKVResponses        [][]byte
+	execRequestsRequiringReply []*gen.ExecServerMessage
+	receivedExecReplies        [][]byte
+	failMidStream              bool
 }
 
 func newFakeCursorRunServer(t *testing.T) *fakeCursorRunServer {
@@ -110,6 +112,27 @@ func (f *fakeCursorRunServer) handle(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}
+
+	// Send any scripted ExecServerMessages that require a synchronous
+	// reply before the turn can proceed, and wait for the client's
+	// ExecClientMessage response on the same stream - this is the
+	// terminal-critic-verified requestContextArgs handshake. If the
+	// client never answers, this read blocks until the test's -timeout
+	// fires, correctly failing a test that doesn't implement the fix.
+	for _, execReq := range f.execRequestsRequiringReply {
+		serverMsg := &gen.AgentServerMessage{
+			Message: &gen.AgentServerMessage_ExecServerMessage{ExecServerMessage: execReq},
+		}
+		raw, _ := proto.Marshal(serverMsg)
+		_, _ = w.Write(frameConnectMessage(raw, 0))
+		flusher.Flush()
+
+		respFrame, err := readOneFrame(r.Body)
+		if err != nil {
+			return
+		}
+		f.receivedExecReplies = append(f.receivedExecReplies, respFrame)
 	}
 
 	for _, update := range f.scriptedUpdates {

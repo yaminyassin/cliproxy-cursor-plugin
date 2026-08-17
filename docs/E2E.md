@@ -7,37 +7,68 @@ account. Per the ralplan-approved plan's two-tier verification strategy
 has also been checked once against a **real** Cursor account through a
 **real** CLIProxyAPI instance. This document is that manual checklist.
 
-## Protocol implementation note (post-boundary-review rework)
+## Protocol implementation notes (post-boundary-review rework)
 
 An initial implementation of the executor used connect-go's generated
-**unary** `Run` client. A terminal review verified against
+**unary** `Run` client. Two rounds of terminal review verified against
 `../gajae-code/packages/ai/src/providers/cursor.ts` that Cursor's real
 `Run` exchange is **not** a simple request/response call: it is a
 bidirectional HTTP/2 stream where the server can send multiple top-level
-messages and can request the client to resolve content-addressed blob
-IDs mid-exchange (the `KvServerMessage`/`KvClientMessage`
-`getBlobArgs`/`setBlobArgs` handshake) before continuing. The unary-only
-implementation silently dropped conversation history, mis-encoded tool
-results, and only ever consumed the first server message.
+messages, can request the client to resolve content-addressed blob IDs
+mid-exchange (`KvServerMessage`/`KvClientMessage`
+`getBlobArgs`/`setBlobArgs`), and can request live execution context
+(`ExecServerMessage`, e.g. `requestContextArgs`) that requires a
+synchronous reply on the same stream before the exchange continues. The
+unary-only implementation silently dropped conversation history,
+mis-encoded tool results, only ever consumed the first server message,
+and could hang indefinitely on any exec-request message.
 
 The executor (`internal/executor/stream.go`) now performs the real
 exchange: a genuine HTTP/2 duplex request, Cursor's own Connect streaming
 frame format, a content-addressed blob store
-(`internal/executor/blobstore.go`), and the `rootPromptMessagesJson`
-field (which is what Cursor's server actually reads to build the model
-prompt - `turns[]` is a UI-history view only). This is covered by tests
+(`internal/executor/blobstore.go`), the `rootPromptMessagesJson` field
+(which is what Cursor's server actually reads to build the model prompt
+- `turns[]` is a UI-history view only), and a generic
+`ExecServerMessage` responder (`internal/executor/execmessage.go`) that
+answers `requestContextArgs` with a minimal real context and answers
+every execution-type request (`readArgs`, `lsArgs`, `shellArgs`, ...)
+with that result type's "rejected" case - this plugin never executes
+tools in-plugin (fact-r5-tool-roundtrip), so declining rather than
+executing is the correct behavior, and declining still lets Cursor's
+exchange complete cleanly instead of hanging. This is covered by tests
 using a real HTTP/2 test server (`h2c`), not a substituted unary mock -
-see `internal/executor/executor_test.go` and `stream_test.go`.
+see `internal/executor/executor_test.go`, `stream_test.go`, and
+`execmessage_test.go`.
 
-**Known remaining gap:** `x_cursor_client_version` is declared as a
-plugin `ConfigField` (so the management UI can display/edit it), but
-`plugin.reconfigure` does not yet parse and apply a live override to the
-running client - the CLIProxyAPI SDK version this plugin builds against
-does not expose a per-plugin config payload in its public lifecycle
-request shape. The compiled-in default is kept in sync with gajae-code's
-`CURSOR_CLIENT_VERSION` at the time of writing
-(`internal/executor/client.go`), and should be re-verified/updated
+`x_cursor_client_version` is a plugin `ConfigField` and now has real
+runtime effect: `plugin.register`/`plugin.reconfigure`'s `config_yaml`
+payload (the host's real lifecycle request shape, confirmed against
+`internal/pluginhost/rpc_schema.go` in the downloaded
+`github.com/router-for-me/CLIProxyAPI/v7` module) is parsed and applied
+to the process-global Cursor HTTP client
+(`internal/dispatch/dispatch.go`'s `applyLifecycleConfig`), verified by a
+test that captures the actual outbound header on a real HTTP request
+after a reconfigure call. The compiled-in default is kept in sync with
+gajae-code's `CURSOR_CLIENT_VERSION` at the time of writing
+(`internal/executor/client.go`) and should be re-verified/updated
 periodically, since Cursor gates backend features on this header.
+
+**Known remaining gap - client-facing streaming is still buffered, not
+incremental:** the exchange **between this plugin and Cursor** is now
+the real, fully bidirectional multi-message protocol described above.
+However, the exchange **between this plugin and the local
+chat-completions client** (CLIProxyAPI's own downstream consumer) is
+still fully buffered: `Executor.ExecuteStream`
+(`internal/executor/executor.go`) waits for the entire Cursor turn to
+finish (or fail) before emitting anything, then returns exactly one
+chunk containing a complete `chat.completion`-shaped payload, not a
+sequence of incremental `chat.completion.chunk`/SSE delta events. A
+downstream client that expects true token-by-token streaming will
+instead see one long pause followed by the full response at once. This
+is a real, load-bearing scope limitation, not a cosmetic detail -
+verify it explicitly in Step 3 below rather than assuming the executor's
+internal protocol fix also fixed client-facing streaming (it did not;
+they are two separate layers).
 
 ## Prerequisites
 
@@ -97,11 +128,16 @@ Confirm:
   an error or empty response.
 - The response shape matches standard chat-completions (`choices[0]
   .message.content`).
-- If the exchange required a Cursor-initiated blob request (this can
-  happen depending on conversation length/complexity), confirm the
-  response still comes back successfully rather than hanging or erroring
-  — this validates the real KV handshake against Cursor's actual
-  backend, not just the local `h2c` test server.
+- If the exchange required a Cursor-initiated blob or exec-context
+  request (this can happen depending on conversation length/complexity),
+  confirm the response still comes back successfully rather than hanging
+  or erroring — this validates the real KV/exec handshakes against
+  Cursor's actual backend, not just the local `h2c` test server.
+- With `"stream": true`, confirm the client-facing response arrives as a
+  single delayed payload rather than incremental chunks (this is the
+  documented buffered-streaming limitation above, not a bug — just
+  confirm it matches the documented behavior rather than silently
+  assuming true incremental streaming works).
 
 ### 4. Multi-turn tool-using conversation
 
@@ -128,6 +164,11 @@ Confirm:
   follow-up question that only makes sense with earlier context) - this
   validates `rootPromptMessagesJson` is actually reaching Cursor's model
   prompt construction, not just being present in the request.
+- If Cursor attempts to execute a tool directly through the exec-request
+  channel (as opposed to surfacing it as a `tool_calls` entry), confirm
+  the plugin declines it (per fact-r5-tool-roundtrip) without hanging or
+  erroring the whole turn, and that the turn still completes with
+  whatever content Cursor could produce despite the decline.
 
 This validates fact-r5-tool-roundtrip end-to-end, beyond what the mocked
 tests can prove on their own.
