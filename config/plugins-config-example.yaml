@@ -1,0 +1,25 @@
+# Example plugins block for wiring the Cursor OAuth plugin into a
+# CLIProxyAPI config.yaml. Merge this into your existing config.yaml (see
+# CLIProxyAPI's own config.example.yaml for the full plugins schema); this
+# file only shows the Cursor-specific slice.
+#
+# CLIProxyAPI loads plugin binaries from `plugins.dir` (default
+# "plugins") by filename, so build the plugin first with `make build`
+# and copy/symlink bin/cursor.<ext> into that directory before starting
+# CLIProxyAPI. The plugin's own identity ("cursor") is what
+# plugins.configs keys off, matching auth.identifier /
+# executor.identifier / the model provider key registered at
+# plugin.register.
+
+plugins:
+  enabled: true
+  dir: "plugins" # bin/cursor.dylib (or .so/.dll) must be present here
+  configs:
+    cursor:
+      enabled: true
+      priority: 1
+      # Optional: overrides the compiled-in x-cursor-client-version
+      # header sent on every Cursor backend request (declared as a
+      # ConfigField at plugin.register in internal/dispatch). Leave
+      # unset to use the plugin's default.
+      # x_cursor_client_version: "1.0.0"
