@@ -7,6 +7,31 @@ account. Per the ralplan-approved plan's two-tier verification strategy
 has also been checked once against a **real** Cursor account through a
 **real** CLIProxyAPI instance. This document is that manual checklist.
 
+## Known v1 scope limitation: buffered, not incremental, streaming
+
+`executor.execute_stream` is implemented on top of Cursor's generated
+Connect-RPC `Run`/`RunSSE` client methods, both of which are **unary**
+RPCs in the codegen this plugin uses (see `internal/cursorpb/README.md`
+and the ADR in the approved plan) — Cursor's own low-level incremental
+multiplexed event stream (the way gajae-code itself consumes it) is built
+on hand-rolled raw HTTP/2 frame parsing outside this codegen path, which
+is explicitly out of scope for v1 per the plan's ADR.
+
+Concretely: **one `Run` call currently surfaces at most one
+`InteractionUpdate` from Cursor's response into the chat-completions
+reply.** For a Cursor turn that emits multiple discrete update events
+(for example, a text delta followed by a separate tool-call-completed
+event as distinct top-level `AgentServerMessage`s rather than one
+combined message), only the first captured update is translated; later
+updates in the same underlying Cursor response are not yet accumulated.
+The per-turn tool-call *batching* behavior itself (multiple tool calls
+arriving within a single `InteractionUpdate`) is fully implemented and
+tested (`TestResponseAccumulator_BatchesMultipleToolCallsIntoOneArray`).
+Step 4 below is the specific manual check for this boundary: if a real
+Cursor tool-using turn spans multiple top-level server messages, confirm
+whether this manifests as a truncated response in practice, and file a
+follow-up story to accumulate across `Run`'s full response if so.
+
 ## Prerequisites
 
 - A built plugin binary: `make build` (produces `bin/cursor.dylib` /
@@ -45,6 +70,11 @@ Cursor login. Confirm:
   `success` status within the host-conformant timeout window (up to 15
   minutes; typically seconds).
 - The account does **not** get stuck in `pending` or silently disappear.
+- Logging in with a second, different Cursor account produces a second,
+  independent account entry (not overwriting the first) — this was a
+  real bug found and fixed during boundary review
+  (`TestPollLogin_TwoAccounts_DoNotCollide`); spot-check it against a
+  real pair of accounts if you have access to more than one.
 
 ### 3. Send a chat request through the local endpoint
 
@@ -75,20 +105,26 @@ Confirm:
   the plugin itself and not silently dropped.
 - Sending the tool result back as a `tool` role message in the next
   request is accepted and the conversation continues coherently (Cursor
-  produces a follow-up response that accounts for the tool result).
+  produces a follow-up response that accounts for the tool result) — the
+  translation layer itself is unit-tested
+  (`TestBuildAgentRunRequest_ToolResultRoundTrip`), but this step
+  verifies Cursor's real backend actually accepts and acts on the
+  re-encoded tool result, which the mock cannot prove.
+- Watch specifically for the buffered-streaming limitation documented
+  above: if Cursor emits the tool call and a text response as separate
+  top-level messages within one turn, confirm whether both arrive in the
+  chat-completions response or only the first.
 
 This validates fact-r5-tool-roundtrip end-to-end, beyond what the mocked
-`TestExecute_SingleToolCallRoundTrip` /
-`TestResponseAccumulator_BatchesMultipleToolCallsIntoOneArray` tests can
-prove on their own (they verify the translation logic in isolation; this
-step verifies it against Cursor's real backend and a real downstream
-client).
+tests can prove on their own (they verify the translation logic in
+isolation; this step verifies it against Cursor's real backend and a
+real downstream client).
 
 ### 5. Force a refresh failure
 
 Simulate a bad stored refresh token (e.g. temporarily corrupt/replace the
-persisted `auths/cursor.json` refresh token with an invalid value, or
-wait for natural expiry and revoke access from your Cursor account
+persisted `auths/<account-id>.json` refresh token with an invalid value,
+or wait for natural expiry and revoke access from your Cursor account
 settings if available) and trigger a refresh (either by waiting for the
 host's normal refresh cycle or by using CLIProxyAPI's manual auth-refresh
 management action, if available).
