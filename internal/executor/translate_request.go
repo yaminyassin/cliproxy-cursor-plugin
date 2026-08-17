@@ -57,8 +57,8 @@ func buildAgentRunRequest(req chatCompletionsRequest) (*gen.AgentRunRequest, err
 
 	return &gen.AgentRunRequest{
 		ConversationState: &gen.ConversationStateStructure{Turns: turns},
-		Action:             action,
-		ModelDetails:       &gen.ModelDetails{ModelId: req.Model},
+		Action:            action,
+		ModelDetails:      &gen.ModelDetails{ModelId: req.Model},
 	}, nil
 }
 
