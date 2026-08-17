@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -46,10 +47,15 @@ type PollResult struct {
 type Poller struct {
 	pending    *pendingLoginStore
 	httpClient *http.Client
-	// consecutiveNetworkErrors is keyed by attempt id, so repeated
-	// transient network failures accumulate toward a terminal error
-	// rather than retrying forever, mirroring the consecutiveErrors >= 3
-	// threshold in gajae-code's own pollCursorAuth reference.
+
+	// networkErrorMu guards consecutiveNetworkErrors. It is a distinct
+	// lock from pendingLoginStore's own mutex (guarding the byID map) so
+	// concurrent Poll calls for different attempt ids never race on the
+	// error-streak counter: repeated transient network failures
+	// accumulate toward a terminal error per attempt id, mirroring the
+	// consecutiveErrors >= 3 threshold in gajae-code's own
+	// pollCursorAuth reference.
+	networkErrorMu           sync.Mutex
 	consecutiveNetworkErrors map[string]int
 }
 
@@ -100,7 +106,7 @@ func (p *Poller) Poll(ctx context.Context, attemptID string) PollResult {
 
 	if time.Now().After(pending.Deadline) {
 		p.pending.delete(attemptID)
-		delete(p.consecutiveNetworkErrors, attemptID)
+		p.clearNetworkErrors(attemptID)
 		return PollResult{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: fmt.Sprintf("timeout: login attempt expired after %s", maxPollDuration),
@@ -125,7 +131,7 @@ func (p *Poller) Poll(ctx context.Context, attemptID string) PollResult {
 	if resp.StatusCode == http.StatusNotFound {
 		// Still pending; reset the network-error streak on any successful
 		// round trip, even a 404, since the transport itself is healthy.
-		delete(p.consecutiveNetworkErrors, attemptID)
+		p.clearNetworkErrors(attemptID)
 		return PollResult{Status: pluginapi.AuthLoginStatusPending}
 	}
 
@@ -136,7 +142,7 @@ func (p *Poller) Poll(ctx context.Context, attemptID string) PollResult {
 
 	if resp.StatusCode != http.StatusOK {
 		p.pending.delete(attemptID)
-		delete(p.consecutiveNetworkErrors, attemptID)
+		p.clearNetworkErrors(attemptID)
 		return PollResult{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: fmt.Sprintf("rejected: cursor poll returned status %d: %s", resp.StatusCode, string(body)),
@@ -146,7 +152,7 @@ func (p *Poller) Poll(ctx context.Context, attemptID string) PollResult {
 	var tokenResp cursorTokenResponse
 	if errUnmarshal := json.Unmarshal(body, &tokenResp); errUnmarshal != nil {
 		p.pending.delete(attemptID)
-		delete(p.consecutiveNetworkErrors, attemptID)
+		p.clearNetworkErrors(attemptID)
 		return PollResult{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: fmt.Sprintf("rejected: failed to parse cursor poll response: %v", errUnmarshal),
@@ -154,7 +160,7 @@ func (p *Poller) Poll(ctx context.Context, attemptID string) PollResult {
 	}
 	if tokenResp.AccessToken == "" {
 		p.pending.delete(attemptID)
-		delete(p.consecutiveNetworkErrors, attemptID)
+		p.clearNetworkErrors(attemptID)
 		return PollResult{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "rejected: cursor poll response missing access token",
@@ -162,7 +168,7 @@ func (p *Poller) Poll(ctx context.Context, attemptID string) PollResult {
 	}
 
 	p.pending.delete(attemptID)
-	delete(p.consecutiveNetworkErrors, attemptID)
+	p.clearNetworkErrors(attemptID)
 	return PollResult{
 		Status:       pluginapi.AuthLoginStatusSuccess,
 		AccessToken:  tokenResp.AccessToken,
@@ -175,11 +181,10 @@ func (p *Poller) Poll(ctx context.Context, attemptID string) PollResult {
 // reported as Pending (so the host keeps polling through a network blip),
 // and only the threshold-exceeding failure is terminal.
 func (p *Poller) handleNetworkError(attemptID string, err error) PollResult {
-	p.consecutiveNetworkErrors[attemptID]++
-	count := p.consecutiveNetworkErrors[attemptID]
+	count := p.incrementNetworkErrors(attemptID)
 	if count >= maxConsecutiveNetworkErrors {
 		p.pending.delete(attemptID)
-		delete(p.consecutiveNetworkErrors, attemptID)
+		p.clearNetworkErrors(attemptID)
 		return PollResult{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: fmt.Sprintf("network_error: too many consecutive poll failures (%d): %v", count, err),
@@ -189,4 +194,17 @@ func (p *Poller) handleNetworkError(attemptID string, err error) PollResult {
 		Status:  pluginapi.AuthLoginStatusPending,
 		Message: fmt.Sprintf("network_error: transient poll failure %d/%d, retrying: %v", count, maxConsecutiveNetworkErrors, err),
 	}
+}
+
+func (p *Poller) incrementNetworkErrors(attemptID string) int {
+	p.networkErrorMu.Lock()
+	defer p.networkErrorMu.Unlock()
+	p.consecutiveNetworkErrors[attemptID]++
+	return p.consecutiveNetworkErrors[attemptID]
+}
+
+func (p *Poller) clearNetworkErrors(attemptID string) {
+	p.networkErrorMu.Lock()
+	defer p.networkErrorMu.Unlock()
+	delete(p.consecutiveNetworkErrors, attemptID)
 }

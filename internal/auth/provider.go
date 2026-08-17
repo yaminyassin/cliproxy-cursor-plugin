@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 
 	"github.com/router-for-me/cliproxy-cursor-plugin/internal/account"
@@ -39,7 +41,11 @@ func (p *Provider) Identifier() string {
 }
 
 // ParseAuth implements pluginapi.AuthProvider: decodes a persisted
-// StorageJSON payload into pluginapi.AuthData.
+// StorageJSON payload into pluginapi.AuthData. The account id is derived
+// from the persisted file name (stable across restarts, and unique per
+// stored account file), not hardcoded to the provider key, so multiple
+// Cursor accounts can be parsed and tracked independently instead of
+// colliding into one account.Store entry.
 func (p *Provider) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
 	storage, err := ParseTokenStorage(req.RawJSON)
 	if err != nil {
@@ -49,9 +55,11 @@ func (p *Provider) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest) 
 		return pluginapi.AuthParseResponse{Handled: false}, nil
 	}
 
+	accountID := accountIDFromFileName(req.FileName)
+
 	authData := pluginapi.AuthData{
 		Provider:         providerIdentifier,
-		ID:               providerIdentifier,
+		ID:               accountID,
 		FileName:         req.FileName,
 		Label:            "Cursor",
 		StorageJSON:      req.RawJSON,
@@ -87,7 +95,10 @@ func (p *Provider) StartLogin(_ context.Context, _ pluginapi.AuthLoginStartReque
 // PollLogin implements pluginapi.AuthProvider: checks one login attempt's
 // status and, on success, records the resulting account in the shared
 // account.Store (per the account-state ownership design, internal/auth is
-// the sole writer).
+// the sole writer). A fresh, unique account id is generated per
+// successful login (not the fixed provider key), so logging in with a
+// second Cursor account creates a second independent account.Store entry
+// instead of overwriting the first.
 func (p *Provider) PollLogin(ctx context.Context, req pluginapi.AuthLoginPollRequest) (pluginapi.AuthLoginPollResponse, error) {
 	result := p.poller.Poll(ctx, req.State)
 
@@ -105,10 +116,12 @@ func (p *Provider) PollLogin(ctx context.Context, req pluginapi.AuthLoginPollReq
 		return pluginapi.AuthLoginPollResponse{}, fmt.Errorf("cursor: failed to marshal token storage: %w", err)
 	}
 
+	accountID := newAccountID()
+
 	authData := pluginapi.AuthData{
 		Provider:         providerIdentifier,
-		ID:               providerIdentifier,
-		FileName:         providerIdentifier + ".json",
+		ID:               accountID,
+		FileName:         accountID + ".json",
 		Label:            "Cursor",
 		StorageJSON:      storageJSON,
 		NextRefreshAfter: expiresAt,
@@ -130,7 +143,10 @@ func (p *Provider) PollLogin(ctx context.Context, req pluginapi.AuthLoginPollReq
 // RefreshAuth implements pluginapi.AuthProvider: refreshes a stored
 // account's tokens, deduplicated per account id, and marks the account
 // degraded in the shared account.Store on failure rather than silently
-// dropping it (fact-r6-model-refresh-policy).
+// dropping it (fact-r6-model-refresh-policy). req.AuthID is the host's
+// existing stable identifier for this specific account (not the
+// provider-wide key), so this already supports multiple independent
+// accounts correctly.
 func (p *Provider) RefreshAuth(ctx context.Context, req pluginapi.AuthRefreshRequest) (pluginapi.AuthRefreshResponse, error) {
 	storage, err := ParseTokenStorage(req.StorageJSON)
 	if err != nil {
@@ -177,4 +193,23 @@ func (p *Provider) RefreshAuth(ctx context.Context, req pluginapi.AuthRefreshReq
 		Auth:             authData,
 		NextRefreshAfter: result.ExpiresAt,
 	}, nil
+}
+
+// newAccountID generates a fresh, unique account identifier for a newly
+// completed login, so distinct Cursor accounts never collide in
+// account.Store or on-disk storage file names.
+func newAccountID() string {
+	return providerIdentifier + "-" + uuid.New().String()
+}
+
+// accountIDFromFileName derives a stable account id from a persisted auth
+// file's name (e.g. "cursor-<uuid>.json" -> "cursor-<uuid>"), so
+// re-parsing the same file across restarts consistently maps to the same
+// account.Store entry.
+func accountIDFromFileName(fileName string) string {
+	trimmed := strings.TrimSuffix(fileName, ".json")
+	if trimmed == "" {
+		return newAccountID()
+	}
+	return trimmed
 }

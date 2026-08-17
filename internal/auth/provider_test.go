@@ -133,11 +133,97 @@ func TestPollLogin_Success(t *testing.T) {
 	if len(pollResp.Auth.StorageJSON) == 0 {
 		t.Errorf("expected non-empty StorageJSON on success")
 	}
+	if pollResp.Auth.ID == "" || pollResp.Auth.ID == providerIdentifier {
+		t.Errorf("auth.ID = %q, want a fresh unique per-account id, not the fixed provider key", pollResp.Auth.ID)
+	}
 
-	st, ok := accounts.Peek("cursor")
+	st, ok := accounts.Peek(pollResp.Auth.ID)
 	if !ok || st.Status != account.StatusActive {
 		t.Errorf("expected account store to record an active cursor account after success, got %+v (ok=%v)", st, ok)
 	}
+}
+
+// TestPollLogin_TwoAccounts_DoNotCollide verifies that logging in with two
+// separate Cursor accounts produces two independent account.Store
+// entries instead of the second login overwriting the first (the fixed
+// "cursor" account id bug found in architect review).
+func TestPollLogin_TwoAccounts_DoNotCollide(t *testing.T) {
+	mock := newMockCursorServer()
+	defer mock.Close()
+	mock.setPollBehavior(func(uuid, verifier string) (int, string) {
+		resp, _ := json.Marshal(cursorTokenResponse{AccessToken: fakeJWTWithSubject(uuid, time.Now().Add(time.Hour)), RefreshToken: "refresh-" + uuid})
+		return http.StatusOK, string(resp)
+	})
+
+	accounts := account.NewStore()
+	provider := NewProvider(accounts, newTestHTTPClient(mock.server.URL))
+
+	start1, err := provider.StartLogin(context.Background(), pluginapi.AuthLoginStartRequest{})
+	if err != nil {
+		t.Fatalf("first StartLogin failed: %v", err)
+	}
+	poll1, err := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: start1.State})
+	if err != nil {
+		t.Fatalf("first PollLogin failed: %v", err)
+	}
+
+	start2, err := provider.StartLogin(context.Background(), pluginapi.AuthLoginStartRequest{})
+	if err != nil {
+		t.Fatalf("second StartLogin failed: %v", err)
+	}
+	poll2, err := provider.PollLogin(context.Background(), pluginapi.AuthLoginPollRequest{State: start2.State})
+	if err != nil {
+		t.Fatalf("second PollLogin failed: %v", err)
+	}
+
+	if poll1.Auth.ID == poll2.Auth.ID {
+		t.Fatalf("expected two distinct account ids for two logins, got the same id %q for both", poll1.Auth.ID)
+	}
+
+	acc1, ok1 := accounts.Peek(poll1.Auth.ID)
+	acc2, ok2 := accounts.Peek(poll2.Auth.ID)
+	if !ok1 || !ok2 {
+		t.Fatalf("expected both accounts present, got ok1=%v ok2=%v", ok1, ok2)
+	}
+	if acc1.AccessToken == acc2.AccessToken {
+		t.Errorf("expected distinct access tokens for two distinct accounts, both were %q", acc1.AccessToken)
+	}
+}
+
+// TestPoll_ConcurrentAttempts_NoRace exercises Poll for many distinct
+// attempt ids concurrently (run with `go test -race`) to catch the
+// unsynchronized consecutiveNetworkErrors map access found in architect
+// review.
+func TestPoll_ConcurrentAttempts_NoRace(t *testing.T) {
+	badServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Skip("hijacking not supported on this platform")
+		}
+		conn, _, _ := hijacker.Hijack()
+		_ = conn.Close()
+	}))
+	defer badServer.Close()
+
+	poller := NewPoller(newTestHTTPClient(badServer.URL))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		attemptID := fmt.Sprintf("attempt-%d", i)
+		poller.pending.put(attemptID, pendingLogin{
+			Verifier:   "v",
+			CursorUUID: attemptID,
+			Deadline:   time.Now().Add(time.Minute),
+		})
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				poller.Poll(context.Background(), id)
+			}
+		}(attemptID)
+	}
+	wg.Wait()
 }
 
 func TestPollLogin_Pending(t *testing.T) {
@@ -365,5 +451,14 @@ func TestRefreshAuth_ConcurrentDedup(t *testing.T) {
 func fakeJWT(exp time.Time) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
 	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, exp.Unix())))
+	return header + "." + payload + ".sig"
+}
+
+// fakeJWTWithSubject builds a fakeJWT that also varies by an arbitrary
+// subject string, so tests distinguishing between multiple logged-in
+// accounts get distinct access token values.
+func fakeJWTWithSubject(subject string, exp time.Time) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d,"sub":%q}`, exp.Unix(), subject)))
 	return header + "." + payload + ".sig"
 }
