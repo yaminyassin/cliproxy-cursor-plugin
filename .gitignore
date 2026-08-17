@@ -2,3 +2,4 @@ bin/
 *.h
 .gjc/
 .e2eprobe-state.json
+e2eprobe
