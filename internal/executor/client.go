@@ -164,6 +164,14 @@ func (c *AgentClient) HTTPClient() *http.Client {
 	return c.httpClient
 }
 
+// DefaultClientVersionForTest exposes the package-private
+// defaultClientVersion constant for cross-package test assertions (e.g.
+// internal/dispatch's reconfigure tests need to assert the header
+// reverts to exactly this value after an override is cleared).
+func DefaultClientVersionForTest() string {
+	return defaultClientVersion
+}
+
 // withAuth sets the per-account Bearer authorization header on a Connect
 // request, matching gajae-code's `authorization: Bearer ${accessToken}`.
 func withAuth[T any](req *connect.Request[T], accessToken string) *connect.Request[T] {

@@ -22,4 +22,4 @@ plugins:
       # header sent on every Cursor backend request (declared as a
       # ConfigField at plugin.register in internal/dispatch). Leave
       # unset to use the plugin's default.
-      # x_cursor_client_version: "1.0.0"
+      # x_cursor_client_version: "cli-2026.02.13-41ac335"

@@ -96,10 +96,70 @@ func TestBuildRejectedResult_ExecutionTypeRequest(t *testing.T) {
 	}
 }
 
+// TestBuildRejectedResult_FallsBackToErrorWhenNoRejectedCase regressions
+// the terminal-critic finding that several real Cursor result types
+// (FetchResult, WriteShellStdinResult, ComputerUseResult: success/error
+// only; RecordScreenResult: no rejected case at all) have no "rejected"
+// oneof case, and buildRejectedResult was silently returning an
+// empty/unset result wrapper for them instead of a genuine terminal
+// decline signal. This iterates every result field actually reachable
+// from ExecServerMessage's declared oneof (via
+// execArgsToResultFieldName) and asserts each constructed result has
+// SOME populated outcome case (not necessarily "rejected" specifically,
+// but never silently empty).
+func TestBuildRejectedResult_FallsBackToErrorWhenNoRejectedCase(t *testing.T) {
+	msg := &gen.ExecServerMessage{}
+	oneofDesc := msg.ProtoReflect().Descriptor().Oneofs().ByName("message")
+	if oneofDesc == nil {
+		t.Fatalf("ExecServerMessage descriptor missing expected 'message' oneof")
+	}
+
+	fields := oneofDesc.Fields()
+	for i := 0; i < fields.Len(); i++ {
+		argsFieldName := string(fields.Get(i).Name())
+		if argsFieldName == "request_context_args" {
+			continue // handled specially, not via buildRejectedResult
+		}
+		resultFieldName, ok := execArgsToResultFieldName(argsFieldName)
+		if !ok {
+			continue
+		}
+
+		resultMsg, err := buildRejectedResult(resultFieldName)
+		if err != nil {
+			t.Errorf("%s: buildRejectedResult(%q) failed: %v", argsFieldName, resultFieldName, err)
+			continue
+		}
+		if resultMsg == nil {
+			t.Errorf("%s: buildRejectedResult(%q) returned a nil message", argsFieldName, resultFieldName)
+			continue
+		}
+
+		outcomeOneof := firstRealOneof(resultMsg.Descriptor())
+		if outcomeOneof == nil {
+			continue // no outcome oneof to check on this result type
+		}
+		which := resultMsg.WhichOneof(outcomeOneof)
+		if which == nil {
+			t.Errorf("%s (%s): constructed result has NO populated outcome case (silently empty, not a genuine decline signal) - fields available: %v", argsFieldName, resultFieldName, oneofFieldNames(outcomeOneof))
+		}
+	}
+}
+
+func oneofFieldNames(od protoreflect.OneofDescriptor) []string {
+	fields := od.Fields()
+	names := make([]string, 0, fields.Len())
+	for i := 0; i < fields.Len(); i++ {
+		names = append(names, string(fields.Get(i).Name()))
+	}
+	return names
+}
+
 // TestExecArgsToResultFieldName_MapsAllDeclaredVariants verifies the
-// generic "_args" -> "_result" naming convention holds for every
-// ExecServerMessage oneof field actually declared in the schema, so the
-// generic mapping in execmessage.go doesn't silently miss a case.
+// generic "_args" -> "_result" naming convention (plus the documented
+// override) holds for every ExecServerMessage oneof field actually
+// declared in the schema, so the generic mapping in execmessage.go
+// doesn't silently miss a case.
 func TestExecArgsToResultFieldName_MapsAllDeclaredVariants(t *testing.T) {
 	msg := &gen.ExecServerMessage{}
 	oneofDesc := msg.ProtoReflect().Descriptor().Oneofs().ByName("message")

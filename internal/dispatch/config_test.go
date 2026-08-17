@@ -114,3 +114,53 @@ func TestApplyLifecycleConfig_EmptyOrMalformed_NoPanic(t *testing.T) {
 		applyLifecycleConfig(p)
 	}
 }
+
+// TestPluginReconfigure_RemovingOverride_RevertsToDefault regressions
+// the terminal-critic finding that removing x_cursor_client_version from
+// a subsequent full reconfigure payload left the previous override
+// stuck indefinitely. CLIProxyAPI sends a FULL normalized config on
+// every register/reconfigure (not a diff), so an absent/empty field in a
+// later real config_yaml payload means "no longer configured" and must
+// clear back to the compiled-in default - verified here with a real
+// captured HTTP header before and after removal.
+func TestPluginReconfigure_RemovingOverride_RevertsToDefault(t *testing.T) {
+	var capturedVersion string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedVersion = r.Header.Get("x-cursor-client-version")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := executor.NewAgentClient(account.NewStore(), server.Client(), server.URL, "")
+	doRequest := func() {
+		req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+		if err != nil {
+			t.Fatalf("failed to build test request: %v", err)
+		}
+		resp, err := client.HTTPClient().Do(req)
+		if err != nil {
+			t.Fatalf("test request failed: %v", err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	// Set the override.
+	setLifecycle := rpcLifecycleRequest{ConfigYAML: []byte("x_cursor_client_version: \"custom-version\"\n")}
+	setBytes, _ := json.Marshal(setLifecycle)
+	applyLifecycleConfigTo(client, setBytes)
+	doRequest()
+	if capturedVersion != "custom-version" {
+		t.Fatalf("setup: expected override to take effect, got %q", capturedVersion)
+	}
+
+	// Reconfigure with a full config that no longer includes the field
+	// (matching CLIProxyAPI's real full-config-on-every-call behavior).
+	clearLifecycle := rpcLifecycleRequest{ConfigYAML: []byte("priority: 1\n")}
+	clearBytes, _ := json.Marshal(clearLifecycle)
+	applyLifecycleConfigTo(client, clearBytes)
+	doRequest()
+
+	if capturedVersion != executor.DefaultClientVersionForTest() {
+		t.Errorf("captured x-cursor-client-version after removing the override = %q, want the compiled-in default %q (stale override was not cleared)", capturedVersion, executor.DefaultClientVersionForTest())
+	}
+}

@@ -342,10 +342,21 @@ type clientVersionSetter interface {
 }
 
 // applyLifecycleConfigTo does the actual config_yaml parse-and-apply
-// work against the given client. A missing, empty, or unparsable payload
-// is not an error - register calls commonly precede any user
-// configuration, and this plugin has a reasonable compiled-in default
-// (see executor.defaultClientVersion).
+// work against the given client. A missing, empty, or unparsable outer
+// request is left alone (no override change) - register calls commonly
+// precede any user configuration, and this plugin has a reasonable
+// compiled-in default (see executor.defaultClientVersion).
+//
+// CLIProxyAPI sends a FULL normalized per-plugin config on every
+// register/reconfigure call, not a diff/patch (see
+// internal/pluginhost/config.go in the downloaded SDK module). So once a
+// real, parsed config_yaml payload is present, x_cursor_client_version
+// being absent or explicitly empty means "no longer configured" and
+// MUST clear any previously-applied override back to
+// executor.defaultClientVersion - otherwise a stale override from an
+// earlier reconfigure call would survive indefinitely even after the
+// user removes it from their config.yaml, which was a real defect found
+// in boundary review.
 func applyLifecycleConfigTo(client clientVersionSetter, request []byte) {
 	if len(request) == 0 {
 		return
@@ -361,7 +372,9 @@ func applyLifecycleConfigTo(client clientVersionSetter, request []byte) {
 	if err := yaml.Unmarshal(lifecycle.ConfigYAML, &cfg); err != nil {
 		return
 	}
-	if cfg.XCursorClientVersion != "" {
-		client.SetClientVersion(cfg.XCursorClientVersion)
-	}
+	// A real config_yaml payload was successfully parsed: always apply
+	// XCursorClientVersion, including the empty-string case, which
+	// SetClientVersion("") correctly treats as "clear the override, use
+	// the compiled-in default" (see AgentClient.clientVersionOrDefault).
+	client.SetClientVersion(cfg.XCursorClientVersion)
 }

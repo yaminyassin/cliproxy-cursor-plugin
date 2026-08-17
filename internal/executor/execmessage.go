@@ -62,16 +62,11 @@ func handleExecServerMessage(execMsg *gen.ExecServerMessage, kv *kvWriter) error
 		return nil
 	}
 
-	rejectedMsg, err := buildRejectedResult(resultFieldName)
+	declinedMsg, err := buildRejectedResult(resultFieldName)
 	if err != nil {
-		return fmt.Errorf("cursor: failed to build rejected result for %s: %w", resultFieldName, err)
+		return fmt.Errorf("cursor: failed to build decline result for %s: %w", resultFieldName, err)
 	}
-	if rejectedMsg == nil {
-		// This result type has no "rejected" case (rare); nothing safe
-		// to send back automatically.
-		return nil
-	}
-	return sendExecClientMessage(kv, execMsg, resultFieldName, rejectedMsg)
+	return sendExecClientMessage(kv, execMsg, resultFieldName, declinedMsg)
 }
 
 // execFieldNameOverrides lists the exceptions to the regular "_args" ->
@@ -119,17 +114,49 @@ func buildRejectedResult(resultFieldName string) (protoreflect.Message, error) {
 	}
 
 	resultMsg := reflectMsg.NewField(fieldDesc).Message()
+	if err := populateDeclineOutcome(resultMsg); err != nil {
+		return nil, err
+	}
+	return resultMsg, nil
+}
+
+// declineOutcomeFieldPriority lists the outcome-oneof case names tried in
+// order to represent "this execution request was declined" on a result
+// message. Not every Cursor result type declares a "rejected" case
+// (confirmed by inspecting internal/cursorpb/gen/agent.pb.go: e.g.
+// FetchResult, WriteShellStdinResult, and ComputerUseResult only declare
+// success/error; RecordScreenResult only declares
+// start_success/save_success/discard_success/failure) - falling back to
+// "error" or "failure" still communicates a genuine non-success terminal
+// outcome to Cursor rather than silently sending an empty, unset result
+// wrapper (which an earlier version of this function did, a real defect
+// caught in boundary review: Cursor would receive neither a rejection
+// nor any typed failure signal for those variants).
+var declineOutcomeFieldPriority = []string{"rejected", "error", "failure"}
+
+// populateDeclineOutcome finds resultMsg's own outcome oneof (e.g.
+// ReadResult's success/error/rejected/... oneof) and populates the
+// highest-priority available case from declineOutcomeFieldPriority with
+// an explanatory message, so every constructed result always carries a
+// genuine terminal decline signal - never an empty/unset wrapper.
+func populateDeclineOutcome(resultMsg protoreflect.Message) error {
 	resultOneof := firstRealOneof(resultMsg.Descriptor())
-	if resultOneof != nil {
-		rejectedField := resultOneof.Fields().ByName("rejected")
-		if rejectedField != nil && rejectedField.Message() != nil {
-			rejectedInner := resultMsg.NewField(rejectedField).Message()
-			setFirstStringField(rejectedInner, "cursor plugin does not execute tools locally; this request was declined")
-			resultMsg.Set(rejectedField, protoreflect.ValueOfMessage(rejectedInner))
-		}
+	if resultOneof == nil {
+		return fmt.Errorf("cursor: result message %s has no outcome oneof to populate a decline signal on", resultMsg.Descriptor().FullName())
 	}
 
-	return resultMsg, nil
+	for _, name := range declineOutcomeFieldPriority {
+		field := resultOneof.Fields().ByName(protoreflect.Name(name))
+		if field == nil || field.Message() == nil {
+			continue
+		}
+		inner := resultMsg.NewField(field).Message()
+		setFirstStringField(inner, "cursor plugin does not execute tools locally; this request was declined")
+		resultMsg.Set(field, protoreflect.ValueOfMessage(inner))
+		return nil
+	}
+
+	return fmt.Errorf("cursor: result message %s has an outcome oneof but none of %v are available to signal a decline", resultMsg.Descriptor().FullName(), declineOutcomeFieldPriority)
 }
 
 // buildMinimalRequestContextResult builds a minimal but real
