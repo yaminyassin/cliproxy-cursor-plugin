@@ -7,4 +7,8 @@ require (
 	google.golang.org/protobuf v1.36.12
 )
 
-require github.com/router-for-me/CLIProxyAPI/v7 v7.2.134
+require (
+	github.com/google/uuid v1.6.0
+	github.com/router-for-me/CLIProxyAPI/v7 v7.2.134
+	golang.org/x/sync v0.22.0
+)

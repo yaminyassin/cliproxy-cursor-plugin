@@ -8,11 +8,15 @@
 package dispatch
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+
+	"github.com/router-for-me/cliproxy-cursor-plugin/internal/account"
+	"github.com/router-for-me/cliproxy-cursor-plugin/internal/auth"
 )
 
 const pluginIdentifier = "cursor"
@@ -21,6 +25,16 @@ const pluginIdentifier = "cursor"
 // derive the semantic-versioning stance from the ralplan-approved plan:
 // bumped on any capability surface or wire-contract change.
 const version = "0.1.0"
+
+// accountStore and authProvider hold the plugin's process-lifetime state.
+// A single dynamic-library plugin instance serves one C ABI dispatch
+// table for its whole lifetime (per cliproxy_plugin_init), so package
+// level state here mirrors that: there is exactly one Cursor auth
+// provider and one account store per loaded plugin instance.
+var (
+	accountStore = account.NewStore()
+	authProvider = auth.NewProvider(accountStore, nil)
+)
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -60,20 +74,22 @@ type identifierResponse struct {
 // and returns the marshaled envelope response. It is the single dispatch
 // table entry point called from cmd/plugin's cgo boundary.
 func HandleMethod(method string, request []byte) ([]byte, error) {
+	ctx := context.Background()
+
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		return okEnvelope(currentRegistration())
 
 	case pluginabi.MethodAuthIdentifier:
-		return okEnvelope(identifierResponse{Identifier: pluginIdentifier})
+		return okEnvelope(identifierResponse{Identifier: authProvider.Identifier()})
 	case pluginabi.MethodAuthParse:
-		return notImplementedEnvelope(pluginabi.MethodAuthParse), nil
+		return handleAuthParse(ctx, request)
 	case pluginabi.MethodAuthLoginStart:
-		return notImplementedEnvelope(pluginabi.MethodAuthLoginStart), nil
+		return handleAuthLoginStart(ctx, request)
 	case pluginabi.MethodAuthLoginPoll:
-		return notImplementedEnvelope(pluginabi.MethodAuthLoginPoll), nil
+		return handleAuthLoginPoll(ctx, request)
 	case pluginabi.MethodAuthRefresh:
-		return notImplementedEnvelope(pluginabi.MethodAuthRefresh), nil
+		return handleAuthRefresh(ctx, request)
 
 	case pluginabi.MethodModelRegister, pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
 		return okEnvelope(pluginapi.ModelResponse{Provider: pluginIdentifier, Models: nil})
@@ -92,6 +108,54 @@ func HandleMethod(method string, request []byte) ([]byte, error) {
 	default:
 		return errorEnvelope("unknown_method", fmt.Sprintf("unknown method: %s", method)), nil
 	}
+}
+
+func handleAuthParse(ctx context.Context, request []byte) ([]byte, error) {
+	var req pluginapi.AuthParseRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return errorEnvelope("invalid_request", fmt.Sprintf("failed to decode auth.parse request: %v", err)), nil
+	}
+	resp, err := authProvider.ParseAuth(ctx, req)
+	if err != nil {
+		return errorEnvelope("auth_parse_failed", err.Error()), nil
+	}
+	return okEnvelope(resp)
+}
+
+func handleAuthLoginStart(ctx context.Context, request []byte) ([]byte, error) {
+	var req pluginapi.AuthLoginStartRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return errorEnvelope("invalid_request", fmt.Sprintf("failed to decode auth.login.start request: %v", err)), nil
+	}
+	resp, err := authProvider.StartLogin(ctx, req)
+	if err != nil {
+		return errorEnvelope("auth_login_start_failed", err.Error()), nil
+	}
+	return okEnvelope(resp)
+}
+
+func handleAuthLoginPoll(ctx context.Context, request []byte) ([]byte, error) {
+	var req pluginapi.AuthLoginPollRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return errorEnvelope("invalid_request", fmt.Sprintf("failed to decode auth.login.poll request: %v", err)), nil
+	}
+	resp, err := authProvider.PollLogin(ctx, req)
+	if err != nil {
+		return errorEnvelope("auth_login_poll_failed", err.Error()), nil
+	}
+	return okEnvelope(resp)
+}
+
+func handleAuthRefresh(ctx context.Context, request []byte) ([]byte, error) {
+	var req pluginapi.AuthRefreshRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return errorEnvelope("invalid_request", fmt.Sprintf("failed to decode auth.refresh request: %v", err)), nil
+	}
+	resp, err := authProvider.RefreshAuth(ctx, req)
+	if err != nil {
+		return errorEnvelope("auth_refresh_failed", err.Error()), nil
+	}
+	return okEnvelope(resp)
 }
 
 // currentRegistration builds the plugin.register / plugin.reconfigure
@@ -139,11 +203,11 @@ func errorEnvelope(code, message string) []byte {
 }
 
 // notImplementedEnvelope marks a declared-but-not-yet-implemented method.
-// G003 (auth_provider) and G004 (executor/model_registrar) replace these
-// with real capability implementations; this keeps the dispatch table
-// (and its routing test) accurate about what is currently wired versus
-// what is a placeholder, per the fail-loud principle: callers see an
-// explicit typed error, never a silent empty success.
+// G004 (executor/model_registrar) replaces these with real capability
+// implementations; this keeps the dispatch table (and its routing test)
+// accurate about what is currently wired versus what is a placeholder,
+// per the fail-loud principle: callers see an explicit typed error, never
+// a silent empty success.
 func notImplementedEnvelope(method string) []byte {
 	return errorEnvelope("not_implemented", fmt.Sprintf("%s is not yet implemented (scheduled in a later story)", method))
 }
