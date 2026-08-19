@@ -1,13 +1,35 @@
 package executor
 
+import "encoding/json"
+
 // chatCompletionsRequest is the minimal subset of the OpenAI chat
 // completions request format this executor accepts (fact-r2-host-
 // conventions: chat-completions is CLIProxyAPI's declared executor input
 // format).
 type chatCompletionsRequest struct {
-	Model    string        `json:"model"`
-	Stream   bool          `json:"stream"`
-	Messages []chatMessage `json:"messages"`
+	Model    string               `json:"model"`
+	Stream   bool                 `json:"stream"`
+	Messages []chatMessage        `json:"messages"`
+	Tools    []chatToolDefinition `json:"tools,omitempty"`
+}
+
+// chatToolDefinition mirrors OpenAI's client-supplied tools[] entry
+// shape ({"type":"function","function":{name,description,parameters}}):
+// a custom tool/function set the local client wants Cursor's model able
+// to call, translated into Cursor's AgentRunRequest.mcp_tools
+// (McpToolDefinition) - see translate_request.go's buildMcpTools. This
+// is distinct from Cursor's own native tools (shell/read/glob/...),
+// which the model can request independent of what the client declares
+// here.
+type chatToolDefinition struct {
+	Type     string                 `json:"type"`
+	Function chatToolDefinitionFunc `json:"function"`
+}
+
+type chatToolDefinitionFunc struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 type chatMessage struct {

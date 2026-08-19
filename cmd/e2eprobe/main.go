@@ -12,6 +12,7 @@
 //	go run ./cmd/e2eprobe chat "your message here"
 //	go run ./cmd/e2eprobe conv [model-id]
 //	go run ./cmd/e2eprobe tool [model-id]
+//	go run ./cmd/e2eprobe mcptool [model-id]
 //	go run ./cmd/e2eprobe models
 //
 // login blocks in a single process until the browser login completes or
@@ -93,6 +94,12 @@ func main() {
 			model = os.Args[2]
 		}
 		cmdTool(ctx, exec, accounts, model)
+	case "mcptool":
+		model := ""
+		if len(os.Args) >= 3 {
+			model = os.Args[2]
+		}
+		cmdMcpTool(ctx, exec, accounts, model)
 	case "models":
 		cmdModels(ctx, disc, accounts)
 	default:
@@ -341,6 +348,125 @@ func cmdTool(ctx context.Context, exec *executor.Executor, accounts *account.Sto
 	fmt.Printf("\nfinish_reason: %s (expected \"tool_calls\")\n", choice.FinishReason)
 	fmt.Println()
 	fmt.Println("This proves Cursor's real ExecServerMessage/InteractionUpdate.ToolCallCompleted path was translated into a standard chat-completions tool_calls entry against the live backend, not a mock.")
+}
+
+// cmdMcpTool sends a message alongside a client-declared custom tool
+// (tools[]), which the plugin translates into Cursor's
+// AgentRunRequest.mcp_tools plus the always-appended native-tools-only
+// system instruction, and prints whether Cursor's model called the
+// declared custom tool instead of (or in addition to) any native tool.
+// This is the real-backend counterpart to
+// TestBuildAgentRunRequest_EncodesClientToolsAsMcpTools /
+// TestBuildAgentRunRequest_ToolsPresent_AppendsNativeToolsOnlySystemPrompt,
+// which only prove the translation at the wire-encoding level.
+func cmdMcpTool(ctx context.Context, exec *executor.Executor, accounts *account.Store, model string) {
+	st := requireLoggedIn()
+	restoreAccount(accounts, st)
+
+	if model == "" {
+		model = "gpt-5-mini"
+	}
+
+	message := "Use the get_weather tool to check the weather in Seoul, then tell me the result."
+
+	payload := map[string]any{
+		"model": model,
+		"messages": []map[string]any{
+			{"role": "user", "content": message},
+		},
+		"tools": []map[string]any{
+			{
+				"type": "function",
+				"function": map[string]any{
+					"name":        "get_weather",
+					"description": "Gets the current weather for a named city",
+					"parameters": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"city": map[string]any{"type": "string", "description": "City name"},
+						},
+						"required": []string{"city"},
+					},
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		fatalf("failed to marshal request: %v", err)
+	}
+
+	fmt.Printf("Sending to Cursor (model=%s) with a declared custom tool \"get_weather\": %q\n\n", model, message)
+	start := time.Now()
+	resp, err := exec.Execute(ctx, pluginapi.ExecutorRequest{
+		AuthID:  st.AuthID,
+		Model:   model,
+		Payload: raw,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		fatalf("Execute failed (real Cursor backend call): %v", err)
+	}
+
+	fmt.Printf("Response received in %s:\n\n", elapsed.Round(time.Millisecond))
+	fmt.Println(string(resp.Payload))
+	fmt.Println()
+
+	var decoded struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if errDecode := json.Unmarshal(resp.Payload, &decoded); errDecode != nil || len(decoded.Choices) == 0 {
+		fmt.Println("(could not decode response for tool_calls inspection)")
+		return
+	}
+
+	choice := decoded.Choices[0]
+	if len(choice.Message.ToolCalls) == 0 {
+		fmt.Println("No tool_calls in the response this turn (model-decided; try re-running).")
+		return
+	}
+
+	fmt.Printf("Cursor requested %d tool call(s):\n\n", len(choice.Message.ToolCalls))
+	sawCustomTool := false
+	sawNativeTool := false
+	for i, tc := range choice.Message.ToolCalls {
+		fmt.Printf("  [%d] id=%s type=%s\n", i, tc.ID, tc.Type)
+		fmt.Printf("      function.name: %s\n", tc.Function.Name)
+		fmt.Printf("      function.arguments: %s\n", tc.Function.Arguments)
+		// mcp_tool_call is the Cursor ToolCall oneof variant for ANY
+		// MCP-declared tool invocation (the actual declared tool name,
+		// e.g. "get_weather", is nested in McpArgs.Name on the incoming
+		// request, not surfaced as this response's top-level
+		// function.name - Cursor's own generic MCP wrapper type, not a
+		// per-tool-name variant). Every other Function.Name value (e.g.
+		// shell_tool_call, glob_tool_call) is one of Cursor's native
+		// tools.
+		if tc.Function.Name == "mcp_tool_call" {
+			sawCustomTool = true
+		} else {
+			sawNativeTool = true
+		}
+	}
+	fmt.Println()
+	if sawCustomTool {
+		fmt.Println("SUCCESS: Cursor's model called the client-declared custom MCP tool via the mcp_tool_call path, proving AgentRunRequest.McpTools reached the model.")
+	}
+	if sawNativeTool {
+		fmt.Println("NOTE: Cursor's model also/instead called a native tool despite the native-tools-only system instruction - this is the always-declined fallback path (fact-r5-tool-roundtrip), not a hang or error, but check the instruction wording if this happens consistently.")
+	}
 }
 
 func requireLoggedIn() probeState {

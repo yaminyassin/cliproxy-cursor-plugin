@@ -2,9 +2,11 @@ package executor
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/router-for-me/cliproxy-cursor-plugin/internal/cursorpb/gen"
 )
@@ -234,5 +236,174 @@ func TestBuildAgentRunRequest_ToolResultRoundTrip(t *testing.T) {
 	}
 	if success.GetStdout() != "file1.txt\nfile2.txt" {
 		t.Errorf("Result.Success.Stdout = %q, want %q (this is the actual content-bearing field; a shallow implementation would leave this empty)", success.GetStdout(), "file1.txt\nfile2.txt")
+	}
+}
+
+// TestBuildAgentRunRequest_EncodesClientToolsAsMcpTools verifies that a
+// client-supplied OpenAI-style tools[] array is translated into
+// AgentRunRequest.McpTools (McpToolDefinition entries), which is the
+// real field Cursor's model reads to learn about caller-provided
+// tools/functions - distinct from Cursor's own native tools.
+func TestBuildAgentRunRequest_EncodesClientToolsAsMcpTools(t *testing.T) {
+	blobs := newBlobStore()
+	req := chatCompletionsRequest{
+		Model: "cursor-fast",
+		Messages: []chatMessage{
+			{Role: "user", Content: "search for something"},
+		},
+		Tools: []chatToolDefinition{
+			{
+				Type: "function",
+				Function: chatToolDefinitionFunc{
+					Name:        "custom_search",
+					Description: "Searches a custom index",
+					Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+				},
+			},
+		},
+	}
+
+	agentReq, err := buildAgentRunRequest(req, blobs)
+	if err != nil {
+		t.Fatalf("buildAgentRunRequest failed: %v", err)
+	}
+
+	mcpTools := agentReq.GetMcpTools()
+	if mcpTools == nil {
+		t.Fatalf("expected McpTools to be set, got nil")
+	}
+	defs := mcpTools.GetMcpTools()
+	if len(defs) != 1 {
+		t.Fatalf("expected 1 McpToolDefinition, got %d", len(defs))
+	}
+
+	def := defs[0]
+	if def.GetName() != "custom_search" || def.GetToolName() != "custom_search" {
+		t.Errorf("name/tool_name = %q/%q, want custom_search/custom_search", def.GetName(), def.GetToolName())
+	}
+	if def.GetDescription() != "Searches a custom index" {
+		t.Errorf("description = %q, want %q", def.GetDescription(), "Searches a custom index")
+	}
+	if def.GetProviderIdentifier() == "" {
+		t.Errorf("expected a non-empty provider_identifier")
+	}
+	if len(def.GetInputSchema()) == 0 {
+		t.Fatalf("expected a non-empty input_schema")
+	}
+
+	var schemaValue structpb.Value
+	if err := proto.Unmarshal(def.GetInputSchema(), &schemaValue); err != nil {
+		t.Fatalf("input_schema is not a valid serialized google.protobuf.Value: %v", err)
+	}
+	schemaJSON := schemaValue.AsInterface()
+	schemaMap, ok := schemaJSON.(map[string]any)
+	if !ok {
+		t.Fatalf("expected decoded schema to be a JSON object, got %T", schemaJSON)
+	}
+	if schemaMap["type"] != "object" {
+		t.Errorf("decoded schema type = %v, want %q", schemaMap["type"], "object")
+	}
+}
+
+// TestBuildAgentRunRequest_NoTools_NoMcpTools verifies that when the
+// client declares no tools, McpTools is left nil rather than an
+// empty-but-present message that could confuse Cursor's own
+// tool-availability signaling.
+func TestBuildAgentRunRequest_NoTools_NoMcpTools(t *testing.T) {
+	blobs := newBlobStore()
+	req := chatCompletionsRequest{
+		Model:    "cursor-fast",
+		Messages: []chatMessage{{Role: "user", Content: "hello"}},
+	}
+
+	agentReq, err := buildAgentRunRequest(req, blobs)
+	if err != nil {
+		t.Fatalf("buildAgentRunRequest failed: %v", err)
+	}
+	if agentReq.GetMcpTools() != nil {
+		t.Errorf("expected McpTools to be nil when no tools are declared, got %+v", agentReq.GetMcpTools())
+	}
+}
+
+// TestBuildAgentRunRequest_ToolsPresent_AppendsNativeToolsOnlySystemPrompt
+// verifies that declaring custom tools causes the always-appendix system
+// instruction (only call declared MCP tools, never native ones) to be
+// appended to root_prompt_messages_json exactly once.
+func TestBuildAgentRunRequest_ToolsPresent_AppendsNativeToolsOnlySystemPrompt(t *testing.T) {
+	blobs := newBlobStore()
+	req := chatCompletionsRequest{
+		Model: "cursor-fast",
+		Messages: []chatMessage{
+			{Role: "user", Content: "do something"},
+			{Role: "user", Content: "final question"},
+		},
+		Tools: []chatToolDefinition{
+			{Type: "function", Function: chatToolDefinitionFunc{Name: "custom_tool"}},
+		},
+	}
+
+	agentReq, err := buildAgentRunRequest(req, blobs)
+	if err != nil {
+		t.Fatalf("buildAgentRunRequest failed: %v", err)
+	}
+
+	rootPromptIDs := agentReq.GetConversationState().GetRootPromptMessagesJson()
+	found := 0
+	for _, id := range rootPromptIDs {
+		raw, ok := blobs.get(id)
+		if !ok {
+			t.Fatalf("root prompt blob id not found in blobStore")
+		}
+		var entry rootPromptEntry
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			t.Fatalf("root prompt entry is not valid JSON: %v", err)
+		}
+		if len(entry.Content) > 0 && strings.Contains(entry.Content[0].Text, nativeToolsOnlyMcpSystemPrompt) {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Errorf("expected the native-tools-only system instruction to appear exactly once, found %d times", found)
+	}
+}
+
+// TestBuildAgentRunRequest_ToolsPresent_SkipsDuplicateInstructionIfClientAlreadyIncludesIt
+// verifies that if the client's own system message already contains the
+// exact native-tools-only instruction text, it is not duplicated.
+func TestBuildAgentRunRequest_ToolsPresent_SkipsDuplicateInstructionIfClientAlreadyIncludesIt(t *testing.T) {
+	blobs := newBlobStore()
+	req := chatCompletionsRequest{
+		Model: "cursor-fast",
+		Messages: []chatMessage{
+			{Role: "system", Content: "You are a helpful assistant. " + nativeToolsOnlyMcpSystemPrompt},
+			{Role: "user", Content: "final question"},
+		},
+		Tools: []chatToolDefinition{
+			{Type: "function", Function: chatToolDefinitionFunc{Name: "custom_tool"}},
+		},
+	}
+
+	agentReq, err := buildAgentRunRequest(req, blobs)
+	if err != nil {
+		t.Fatalf("buildAgentRunRequest failed: %v", err)
+	}
+
+	rootPromptIDs := agentReq.GetConversationState().GetRootPromptMessagesJson()
+	found := 0
+	for _, id := range rootPromptIDs {
+		raw, ok := blobs.get(id)
+		if !ok {
+			t.Fatalf("root prompt blob id not found in blobStore")
+		}
+		var entry rootPromptEntry
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			t.Fatalf("root prompt entry is not valid JSON: %v", err)
+		}
+		if len(entry.Content) > 0 && strings.Contains(entry.Content[0].Text, nativeToolsOnlyMcpSystemPrompt) {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Errorf("expected the native-tools-only instruction to appear exactly once (from the client's own system message, not duplicated), found %d times", found)
 	}
 }

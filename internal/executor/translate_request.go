@@ -5,13 +5,37 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/router-for-me/cliproxy-cursor-plugin/internal/cursorpb/gen"
 )
+
+// mcpToolsProviderIdentifier is the provider_identifier value set on
+// every McpToolDefinition this plugin builds from a client-supplied
+// tools[] array, matching gajae-code's own convention
+// (providerIdentifier: "pi-agent" in buildMcpToolDefinitions) of
+// stamping a stable, host-identifying string rather than leaving it
+// empty.
+const mcpToolsProviderIdentifier = "cliproxy-cursor-plugin"
+
+// nativeToolsOnlyMcpSystemPrompt is appended as the last root-prompt-JSON
+// system entry (see buildRootPromptMessageBlobIDs) whenever the client
+// declares at least one custom tool via tools[]. This plugin already
+// declines every Cursor-native tool-execution request via the
+// ExecServerMessage handshake (execmessage.go, fact-r5-tool-roundtrip:
+// never execute tools in-plugin), but Cursor's model itself doesn't know
+// that ahead of time and may still choose to invoke a native tool
+// (shell/read/glob/...) when one looks like a better fit than a declared
+// MCP tool - the resulting decline is functionally safe (no execution
+// happens) but wastes a full round trip and confuses the model's own
+// plan. Explicitly instructing the model up front to prefer/only use the
+// declared MCP tool set avoids that wasted round trip.
+const nativeToolsOnlyMcpSystemPrompt = "You have been given a specific set of tools for this conversation. Only call the tools explicitly provided to you; do not attempt to use any other built-in or native tools (such as shell, file read/write, glob, or grep) even if they appear to be available - those requests will always be declined."
 
 // buildAgentRunRequest translates a chat-completions request into a
 // Cursor AgentRunRequest. The last user message becomes the turn's
@@ -67,9 +91,14 @@ func buildAgentRunRequest(req chatCompletionsRequest, blobs *blobStore) (*gen.Ag
 		return nil, fmt.Errorf("cursor: failed to encode conversation history turns: %w", err)
 	}
 
-	rootPromptIDs, err := buildRootPromptMessageBlobIDs(history, blobs)
+	rootPromptIDs, err := buildRootPromptMessageBlobIDs(history, req.Tools, blobs)
 	if err != nil {
 		return nil, fmt.Errorf("cursor: failed to encode root prompt messages: %w", err)
+	}
+
+	mcpTools, err := buildMcpTools(req.Tools)
+	if err != nil {
+		return nil, fmt.Errorf("cursor: failed to encode client tool definitions: %w", err)
 	}
 
 	return &gen.AgentRunRequest{
@@ -79,7 +108,79 @@ func buildAgentRunRequest(req chatCompletionsRequest, blobs *blobStore) (*gen.Ag
 		},
 		Action:       action,
 		ModelDetails: &gen.ModelDetails{ModelId: req.Model},
+		McpTools:     mcpTools,
 	}, nil
+}
+
+// buildMcpTools translates a client-supplied OpenAI-style tools[] array
+// into Cursor's AgentRunRequest.mcp_tools (McpTools{ []*McpToolDefinition
+// }), which is the real field Cursor's model reads to learn about
+// tools/functions the CALLER wants it able to invoke - distinct from
+// Cursor's own native tools (shell/read/glob/...), which are always
+// available to the model independent of what is declared here. Each
+// function's JSON Schema `parameters` is re-encoded as a serialized
+// google.protobuf.Value (input_schema []byte), matching gajae-code's own
+// buildMcpToolDefinitions (toBinary(ValueSchema, fromJson(ValueSchema,
+// schemaValue))) - Cursor's wire contract expects the schema as a
+// well-known-type Value blob, not raw JSON text. Returns nil (no
+// McpTools field set) when the client declared no tools, which is the
+// common case and must not send an empty-but-present McpTools that could
+// otherwise confuse Cursor's own tool-availability signaling.
+func buildMcpTools(tools []chatToolDefinition) (*gen.McpTools, error) {
+	if len(tools) == 0 {
+		return nil, nil
+	}
+
+	defs := make([]*gen.McpToolDefinition, 0, len(tools))
+	for _, t := range tools {
+		if t.Function.Name == "" {
+			continue
+		}
+
+		schemaValue, err := toolParametersToStructValue(t.Function.Parameters)
+		if err != nil {
+			return nil, fmt.Errorf("cursor: failed to parse tool %q parameters: %w", t.Function.Name, err)
+		}
+		inputSchema, err := proto.Marshal(schemaValue)
+		if err != nil {
+			return nil, fmt.Errorf("cursor: failed to marshal tool %q input schema: %w", t.Function.Name, err)
+		}
+
+		defs = append(defs, &gen.McpToolDefinition{
+			Name:               t.Function.Name,
+			Description:        t.Function.Description,
+			ProviderIdentifier: mcpToolsProviderIdentifier,
+			ToolName:           t.Function.Name,
+			InputSchema:        inputSchema,
+		})
+	}
+
+	if len(defs) == 0 {
+		return nil, nil
+	}
+	return &gen.McpTools{McpTools: defs}, nil
+}
+
+// toolParametersToStructValue parses a client-supplied JSON Schema
+// (tools[].function.parameters) into a google.protobuf.Value, falling
+// back to an empty object schema when absent - matching gajae-code's own
+// default ({ type: "object", properties: {}, required: [] }) so a tool
+// with no declared parameters still round-trips as a valid, empty
+// object schema rather than a missing/null value Cursor might reject.
+func toolParametersToStructValue(parameters json.RawMessage) (*structpb.Value, error) {
+	if len(parameters) == 0 {
+		return structpb.NewValue(map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+			"required":   []any{},
+		})
+	}
+
+	var decoded any
+	if err := json.Unmarshal(parameters, &decoded); err != nil {
+		return nil, err
+	}
+	return structpb.NewValue(decoded)
 }
 
 // buildHistoryTurnBlobIDs encodes every history message into
@@ -221,14 +322,26 @@ type rootPromptContentPart struct {
 // user-role "[Tool Result]" entry, matching the reference's own
 // toolResultToText handling, since root_prompt_messages_json has no
 // dedicated tool-result shape.
-func buildRootPromptMessageBlobIDs(messages []chatMessage, blobs *blobStore) ([][]byte, error) {
+//
+// When tools is non-empty (the client declared its own custom tool
+// set), nativeToolsOnlyMcpSystemPrompt is appended as a final system
+// entry - UNLESS a system message already present in messages already
+// contains that exact instruction (a client that manages its own system
+// prompt and already includes the same guidance should not get it
+// duplicated).
+func buildRootPromptMessageBlobIDs(messages []chatMessage, tools []chatToolDefinition, blobs *blobStore) ([][]byte, error) {
 	var ids [][]byte
+	alreadyHasNativeToolsInstruction := false
+
 	for _, msg := range messages {
 		var entry rootPromptEntry
 		switch msg.Role {
 		case "system":
 			if msg.Content == "" {
 				continue
+			}
+			if strings.Contains(msg.Content, nativeToolsOnlyMcpSystemPrompt) {
+				alreadyHasNativeToolsInstruction = true
 			}
 			entry = rootPromptEntry{Role: "user", Content: []rootPromptContentPart{{Type: "text", Text: "[System]\n" + msg.Content}}}
 		case "user":
@@ -256,6 +369,16 @@ func buildRootPromptMessageBlobIDs(messages []chatMessage, blobs *blobStore) ([]
 		}
 		ids = append(ids, blobs.put(raw))
 	}
+
+	if len(tools) > 0 && !alreadyHasNativeToolsInstruction {
+		entry := rootPromptEntry{Role: "user", Content: []rootPromptContentPart{{Type: "text", Text: "[System]\n" + nativeToolsOnlyMcpSystemPrompt}}}
+		raw, err := json.Marshal(entry)
+		if err != nil {
+			return nil, fmt.Errorf("cursor: failed to marshal native-tools-only system entry: %w", err)
+		}
+		ids = append(ids, blobs.put(raw))
+	}
+
 	return ids, nil
 }
 
