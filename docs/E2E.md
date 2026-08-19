@@ -281,3 +281,30 @@ a real defect the mocked suite could not: the mocked
 `TestExecute_SingleToolCallRoundTrip` construct their own well-formed
 `CallId` fixtures and never exercised what Cursor's real backend
 actually sends.
+
+### 2026-08-19 (continued) — custom client-declared tools (tools[] -> McpTools)
+
+Ran via `go run ./cmd/e2eprobe mcptool [model-id]` (new probe command),
+which declares a custom `get_weather` tool via an OpenAI-style `tools[]`
+array on the request and asks Cursor's model to call it.
+
+- Before this change, `chatCompletionsRequest` had no `tools` field at
+  all - a client-supplied custom tool set was silently ignored and
+  never reached Cursor's model.
+- Implemented `buildMcpTools` (translates declared tools into Cursor's
+  real `AgentRunRequest.McpTools`/`McpToolDefinition`, matching
+  gajae-code's `input_schema`-as-serialized-`google.protobuf.Value`
+  wire convention) plus an always-appended system instruction
+  (`nativeToolsOnlyMcpSystemPrompt`) telling the model to only call
+  declared tools, never Cursor's native ones - skipped if the client's
+  own system message already contains the identical instruction.
+- **Verified live, 2/2 runs**: Cursor's model correctly called the
+  declared custom `get_weather` tool via the `mcp_tool_call` path (not
+  any native tool like `shell_tool_call`) both times, proving
+  `McpTools` and the system instruction both genuinely reach the real
+  model, not just the wire encoding. The plugin correctly declined
+  in-plugin execution per fact-r5-tool-roundtrip and Cursor's model
+  handled the decline gracefully in both responses.
+
+This closes the "custom tool sets work with this plugin" question:
+before this change, no; after, yes, verified against the real backend.
