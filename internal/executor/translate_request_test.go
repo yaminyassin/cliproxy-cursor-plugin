@@ -41,9 +41,12 @@ func TestBuildAgentRunRequest_EncodesConversationHistoryAsBlobIDs(t *testing.T) 
 		t.Errorf("current turn text = %q, want %q", agentReq.GetAction().GetUserMessageAction().GetUserMessage().GetText(), "second question")
 	}
 
+	// Turns are GROUPED: one turn per user message, with the assistant
+	// reply that follows recorded as a step of that turn (not its own
+	// turn). See buildHistoryTurnBlobIDs.
 	turnIDs := agentReq.GetConversationState().GetTurns()
-	if len(turnIDs) != 2 {
-		t.Fatalf("expected 2 history turn blob ids (first user + first assistant), got %d", len(turnIDs))
+	if len(turnIDs) != 1 {
+		t.Fatalf("expected 1 grouped history turn (user + assistant step), got %d", len(turnIDs))
 	}
 
 	// Each turns[] entry must be a blob ID resolvable through the shared
@@ -75,28 +78,19 @@ func TestBuildAgentRunRequest_EncodesConversationHistoryAsBlobIDs(t *testing.T) 
 		t.Errorf("turn 0 user message = %q, want %q", userMsg0.GetText(), "first question")
 	}
 
-	turn1Bytes, ok := blobs.get(turnIDs[1])
+	if len(agentTurn0.GetSteps()) != 1 {
+		t.Fatalf("expected the assistant reply as 1 step of the grouped turn, got %d", len(agentTurn0.GetSteps()))
+	}
+	stepBytes, ok := blobs.get(agentTurn0.GetSteps()[0])
 	if !ok {
-		t.Fatalf("turn 1 blob id not found in blobStore")
+		t.Fatalf("turn 0 step blob id not found in blobStore")
 	}
-	var turn1 gen.ConversationTurnStructure
-	if err := proto.Unmarshal(turn1Bytes, &turn1); err != nil {
-		t.Fatalf("failed to unmarshal turn 1 blob: %v", err)
+	var step0 gen.ConversationStep
+	if err := proto.Unmarshal(stepBytes, &step0); err != nil {
+		t.Fatalf("failed to unmarshal turn 0 step blob: %v", err)
 	}
-	agentTurn1 := turn1.GetAgentConversationTurn()
-	if agentTurn1 == nil || len(agentTurn1.GetSteps()) != 1 {
-		t.Fatalf("expected turn 1 to have 1 step blob id, got %+v", agentTurn1)
-	}
-	stepBytes, ok := blobs.get(agentTurn1.GetSteps()[0])
-	if !ok {
-		t.Fatalf("turn 1 step blob id not found in blobStore")
-	}
-	var step1 gen.ConversationStep
-	if err := proto.Unmarshal(stepBytes, &step1); err != nil {
-		t.Fatalf("failed to unmarshal turn 1 step blob: %v", err)
-	}
-	if step1.GetAssistantMessage().GetText() != "first answer" {
-		t.Errorf("turn 1 assistant message = %q, want %q", step1.GetAssistantMessage().GetText(), "first answer")
+	if step0.GetAssistantMessage().GetText() != "first answer" {
+		t.Errorf("turn 0 step assistant message = %q, want %q", step0.GetAssistantMessage().GetText(), "first answer")
 	}
 }
 
@@ -189,12 +183,14 @@ func TestBuildAgentRunRequest_ToolResultRoundTrip(t *testing.T) {
 		t.Fatalf("buildAgentRunRequest failed: %v", err)
 	}
 
+	// Grouped: the user message plus the assistant tool call and the tool
+	// result are all ONE turn (see buildHistoryTurnBlobIDs).
 	turnIDs := agentReq.GetConversationState().GetTurns()
-	if len(turnIDs) != 3 {
-		t.Fatalf("expected 3 history turns (user, assistant-with-tool-call, tool-result), got %d", len(turnIDs))
+	if len(turnIDs) != 1 {
+		t.Fatalf("expected 1 grouped history turn (user + tool-call step + tool-result step), got %d", len(turnIDs))
 	}
 
-	toolResultTurnBytes, ok := blobs.get(turnIDs[2])
+	toolResultTurnBytes, ok := blobs.get(turnIDs[0])
 	if !ok {
 		t.Fatalf("tool-result turn blob id not found in blobStore")
 	}
@@ -203,10 +199,11 @@ func TestBuildAgentRunRequest_ToolResultRoundTrip(t *testing.T) {
 		t.Fatalf("failed to unmarshal tool-result turn: %v", err)
 	}
 	agentTurn := toolResultTurn.GetAgentConversationTurn()
-	if agentTurn == nil || len(agentTurn.GetSteps()) != 1 {
-		t.Fatalf("expected the tool-result turn to have 1 step blob id, got %+v", agentTurn)
+	if agentTurn == nil || len(agentTurn.GetSteps()) != 2 {
+		t.Fatalf("expected the grouped turn to have 2 step blob ids (tool call, tool result), got %+v", agentTurn)
 	}
-	stepBytes, ok := blobs.get(agentTurn.GetSteps()[0])
+	// The tool result is the LAST step of the turn.
+	stepBytes, ok := blobs.get(agentTurn.GetSteps()[1])
 	if !ok {
 		t.Fatalf("tool-result step blob id not found in blobStore")
 	}

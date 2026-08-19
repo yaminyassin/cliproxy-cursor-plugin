@@ -210,96 +210,130 @@ func toolParametersToStructValue(parameters json.RawMessage) (*structpb.Value, e
 	return structpb.NewValue(decoded)
 }
 
-// buildHistoryTurnBlobIDs encodes every history message into
-// ConversationState.Turns entries as blob IDs (not the serialized bytes
-// directly - Cursor resolves each turns[] entry, and each turn's
-// user_message/steps sub-entries, through the KvServerMessage
-// getBlobArgs handshake during the live exchange). This mirrors
-// gajae-code's buildConversationTurns and is the UI-side history view;
+// buildHistoryTurnBlobIDs encodes history into ConversationState.Turns as
+// blob IDs (not serialized bytes directly - Cursor resolves each turns[]
+// entry, and each turn's user_message/steps sub-entries, through the
+// KvServerMessage getBlobArgs handshake during the live exchange).
+//
+// Messages are GROUPED into turns the way gajae-code's
+// buildConversationTurns does it: one turn per user message, with every
+// assistant reply and tool result that follows it recorded as that turn's
+// steps. An earlier version emitted one turn per MESSAGE, so each
+// assistant reply and each tool result became its own turn - roughly 3-4x
+// the turn count Cursor expects in an agent loop, growing every iteration.
+// That inflated the blob set re-resolved on each turn and matched the
+// escalating per-turn latency measured live on 2026-08-19 (24s -> 60s over
+// 8 turns, while an identical large FIRST-turn request took only 4s).
+//
+// Note this is Cursor's UI-side history view;
 // buildRootPromptMessageBlobIDs below is what actually reaches the model.
 func buildHistoryTurnBlobIDs(messages []chatMessage, blobs *blobStore) ([][]byte, error) {
 	var turns [][]byte
 	pendingToolCallsByID := map[string]chatToolCall{}
 
-	for _, msg := range messages {
-		switch msg.Role {
-		case "system":
-			if msg.Content == "" {
-				continue
-			}
-			turn, err := userTurnBlobID("[system] "+msg.Content, blobs)
-			if err != nil {
-				return nil, err
-			}
-			turns = append(turns, turn)
+	opensTurn := func(role string) bool { return role == "user" || role == "system" }
 
-		case "user":
-			turn, err := userTurnBlobID(msg.Content, blobs)
-			if err != nil {
-				return nil, err
-			}
-			turns = append(turns, turn)
-
-		case "assistant":
-			var stepBlobIDs [][]byte
-			if msg.Content != "" {
-				stepBytes, err := proto.Marshal(&gen.ConversationStep{
-					Message: &gen.ConversationStep_AssistantMessage{
-						AssistantMessage: &gen.AssistantMessage{Text: msg.Content},
-					},
-				})
-				if err != nil {
-					return nil, err
-				}
-				stepBlobIDs = append(stepBlobIDs, blobs.put(stepBytes))
-			}
-			for _, tc := range msg.ToolCalls {
-				pendingToolCallsByID[tc.ID] = tc
-				toolCallMsg, err := chatToolCallToToolCall(tc)
-				if err != nil {
-					return nil, err
-				}
-				stepBytes, err := proto.Marshal(&gen.ConversationStep{
-					Message: &gen.ConversationStep_ToolCall{ToolCall: toolCallMsg},
-				})
-				if err != nil {
-					return nil, err
-				}
-				stepBlobIDs = append(stepBlobIDs, blobs.put(stepBytes))
-			}
-			turn, err := stepsTurnBlobID(stepBlobIDs, blobs)
-			if err != nil {
-				return nil, err
-			}
-			turns = append(turns, turn)
-
-		case "tool":
-			original, ok := pendingToolCallsByID[msg.ToolCallID]
-			if !ok {
-				turn, err := userTurnBlobID("[tool result] "+msg.Content, blobs)
-				if err != nil {
-					return nil, err
-				}
-				turns = append(turns, turn)
-				continue
-			}
-			toolCallWithResult, err := chatToolCallToToolCallWithResult(original, msg.Content)
-			if err != nil {
-				return nil, err
-			}
-			stepBytes, err := proto.Marshal(&gen.ConversationStep{
-				Message: &gen.ConversationStep_ToolCall{ToolCall: toolCallWithResult},
-			})
-			if err != nil {
-				return nil, err
-			}
-			turn, err := stepsTurnBlobID([][]byte{blobs.put(stepBytes)}, blobs)
-			if err != nil {
-				return nil, err
-			}
-			turns = append(turns, turn)
-			delete(pendingToolCallsByID, msg.ToolCallID)
+	for i := 0; i < len(messages); {
+		msg := messages[i]
+		if !opensTurn(msg.Role) {
+			// A stray assistant/tool message with no preceding user
+			// message cannot open a turn; skip it rather than fabricating
+			// an empty user turn for it.
+			i++
+			continue
 		}
+
+		text := msg.Content
+		if msg.Role == "system" {
+			text = "[system] " + msg.Content
+		}
+		if text == "" {
+			i++
+			continue
+		}
+
+		userMsgBytes, err := proto.Marshal(&gen.UserMessage{Text: text})
+		if err != nil {
+			return nil, fmt.Errorf("cursor: failed to marshal user message: %w", err)
+		}
+		userBlobID := blobs.put(userMsgBytes)
+		i++
+
+		// Collect this turn's steps: everything up to the next message
+		// that opens a turn.
+		var stepBlobIDs [][]byte
+		for i < len(messages) && !opensTurn(messages[i].Role) {
+			step := messages[i]
+			i++
+
+			switch step.Role {
+			case "assistant":
+				if step.Content != "" {
+					stepBytes, errStep := proto.Marshal(&gen.ConversationStep{
+						Message: &gen.ConversationStep_AssistantMessage{
+							AssistantMessage: &gen.AssistantMessage{Text: step.Content},
+						},
+					})
+					if errStep != nil {
+						return nil, errStep
+					}
+					stepBlobIDs = append(stepBlobIDs, blobs.put(stepBytes))
+				}
+				for _, tc := range step.ToolCalls {
+					pendingToolCallsByID[tc.ID] = tc
+					toolCallMsg, errTool := chatToolCallToToolCall(tc)
+					if errTool != nil {
+						return nil, errTool
+					}
+					stepBytes, errStep := proto.Marshal(&gen.ConversationStep{
+						Message: &gen.ConversationStep_ToolCall{ToolCall: toolCallMsg},
+					})
+					if errStep != nil {
+						return nil, errStep
+					}
+					stepBlobIDs = append(stepBlobIDs, blobs.put(stepBytes))
+				}
+
+			case "tool":
+				original, known := pendingToolCallsByID[step.ToolCallID]
+				if !known {
+					// No originating call in this window: record the result
+					// as assistant text so it is not lost, matching
+					// gajae-code's own "[Tool Result]" step handling.
+					stepBytes, errStep := proto.Marshal(&gen.ConversationStep{
+						Message: &gen.ConversationStep_AssistantMessage{
+							AssistantMessage: &gen.AssistantMessage{Text: "[Tool Result]\n" + step.Content},
+						},
+					})
+					if errStep != nil {
+						return nil, errStep
+					}
+					stepBlobIDs = append(stepBlobIDs, blobs.put(stepBytes))
+					continue
+				}
+				toolCallWithResult, errTool := chatToolCallToToolCallWithResult(original, step.Content)
+				if errTool != nil {
+					return nil, errTool
+				}
+				stepBytes, errStep := proto.Marshal(&gen.ConversationStep{
+					Message: &gen.ConversationStep_ToolCall{ToolCall: toolCallWithResult},
+				})
+				if errStep != nil {
+					return nil, errStep
+				}
+				stepBlobIDs = append(stepBlobIDs, blobs.put(stepBytes))
+				delete(pendingToolCallsByID, step.ToolCallID)
+			}
+		}
+
+		turnBlobID, err := turnStructureBlobID(&gen.AgentConversationTurnStructure{
+			UserMessage: userBlobID,
+			Steps:       stepBlobIDs,
+		}, blobs)
+		if err != nil {
+			return nil, err
+		}
+		turns = append(turns, turnBlobID)
 	}
 
 	return turns, nil
