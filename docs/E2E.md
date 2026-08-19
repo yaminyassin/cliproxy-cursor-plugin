@@ -364,3 +364,49 @@ simplified manual requests cannot prove.
 This closes the "custom tool sets work with this plugin" question:
 before, no; after these fixes, yes - verified against the real backend
 through a real client, not a probe.
+
+### 2026-08-19 (continued) — measured blob-cache behavior, and a correction
+
+Commit 48c025d ("Group history into proper conversation turns") frames turn
+grouping primarily as a **performance** fix. A later measurement shows that
+emphasis was overstated. Recording it here so the repository's own record is
+accurate rather than leaving the commit message as the last word.
+
+Instrumented `getBlobArgs` handling (temporary, since reverted) across a
+5-turn conversation with growing history:
+
+| turn | blobs we hold | Cursor `getBlobArgs` | turns sent | elapsed |
+|------|---------------|----------------------|------------|---------|
+| 1    | 11            | 2                    | 1          | 4.4s    |
+| 2    | 23            | 4                    | 2          | 5.3s    |
+| 3    | 35            | 6                    | 3          | 5.2s    |
+| 4    | 46            | 8                    | 4          | 2.9s    |
+| 5    | 57            | 10                   | 5          | 7.9s    |
+
+What this establishes:
+
+- **Cursor does honor content-addressed caching.** At turn 5 we hold 57 blobs
+  and it requests only 10, so it is not re-pulling history it already has.
+- **But a fixed slice is never amortized:** it re-fetches ~2 blobs per turn
+  (the turn wrapper and its user-message blob) on EVERY request, so
+  `getBlobArgs` grows as `2 x turn_count` indefinitely. Turn count is the
+  multiplier, which is why one-turn-per-message (roughly 3x the turns) cost
+  proportionally more round trips.
+- **However, that cost is not dominant at these scales.** Ten round trips at
+  turn 5 is small next to model time, and the elapsed column is noisy and
+  model-dominated. The earlier "24s -> 60s climbing" observation was a single
+  run, and causation was read into it that had not been established.
+
+Corrected conclusion: turn grouping is justified by **fidelity** - it matches
+Cursor's actual conversation model, per gajae-code's `buildConversationTurns`
+- with a round-trip reduction as a secondary benefit that only becomes
+material at high turn counts (roughly 30-50+ turns).
+
+Separately settled: the recurring **exactly-2m0s** requests are the CLIENT's
+120s timeout, not a server-side stall. Two distinct trace ids were observed
+both at exactly 2m0s and both ending at the same instant, which is a client
+aborting concurrent in-flight requests. gjc issues title generation alongside
+the main turn, and on a high-reasoning model variant
+(`cursor-grok-4.6-high`) two concurrent turns exceed that budget; the same
+session on a low-reasoning variant runs 10-13s per turn. This is a model-speed
+and client-timeout interaction, not a plugin defect.
