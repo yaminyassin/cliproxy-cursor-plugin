@@ -347,7 +347,7 @@ func TestResponseAccumulator_BatchesMultipleToolCallsIntoOneArray(t *testing.T) 
 		},
 	})
 
-	resp := acc.toChatCompletionsResponse("cursor-fast", "resp-1")
+	resp := acc.toChatCompletionsResponse("cursor-fast", "resp-1", "prompt")
 	toolCalls := resp.Choices[0].Message.ToolCalls
 	if len(toolCalls) != 2 {
 		t.Fatalf("expected 2 batched tool calls in one array, got %d", len(toolCalls))
@@ -395,24 +395,45 @@ func TestExecuteStream_MidStreamDrop_PreservesPartialContentAndSurfacesError(t *
 		t.Fatalf("ExecuteStream returned a transport-level error instead of a chunk-level one: %v", err)
 	}
 
-	var gotChunk bool
+	// Streaming now emits the OpenAI chunk format (object ==
+	// "chat.completion.chunk", choices[].delta), so assert on that shape:
+	// the partial content must still arrive in a delta and the terminal
+	// error must still be surfaced, never a silently truncated success.
+	var (
+		gotChunk    bool
+		sawPartial  bool
+		sawTerminal bool
+	)
 	for chunk := range streamResp.Chunks {
 		gotChunk = true
 		if chunk.Err != nil {
+			sawTerminal = true
 			continue
 		}
-		var chatResp chatCompletionsResponse
-		if errUnmarshal := json.Unmarshal(chunk.Payload, &chatResp); errUnmarshal == nil {
-			if chatResp.Error == nil {
-				t.Errorf("expected the chunk to carry a terminal error alongside any partial content, got a clean success with content %q", chatResp.Choices[0].Message.Content)
-			}
-			if len(chatResp.Choices) > 0 && chatResp.Choices[0].Message.Content != "partial content before drop" {
-				t.Errorf("expected partial content to be preserved (never silently truncated), got %q", chatResp.Choices[0].Message.Content)
+		var streamChunk chatCompletionChunk
+		if errUnmarshal := json.Unmarshal(chunk.Payload, &streamChunk); errUnmarshal != nil {
+			continue
+		}
+		if streamChunk.Object != "chat.completion.chunk" {
+			t.Errorf("streaming chunk object = %q, want chat.completion.chunk (clients parse only this shape)", streamChunk.Object)
+		}
+		if streamChunk.Error != nil {
+			sawTerminal = true
+		}
+		for _, choice := range streamChunk.Choices {
+			if choice.Delta.Content == "partial content before drop" {
+				sawPartial = true
 			}
 		}
 	}
 	if !gotChunk {
 		t.Fatalf("expected at least one chunk (error or partial-with-error), got none")
+	}
+	if !sawPartial {
+		t.Errorf("expected partial content to be preserved in a delta (never silently truncated)")
+	}
+	if !sawTerminal {
+		t.Errorf("expected a terminal error to be surfaced alongside the partial content")
 	}
 }
 

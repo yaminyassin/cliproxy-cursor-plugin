@@ -3,6 +3,9 @@ package executor
 import (
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
+
 	"github.com/router-for-me/cliproxy-cursor-plugin/internal/cursorpb/gen"
 )
 
@@ -38,19 +41,58 @@ func TestToChatToolCall_NilToolCall_NoPanic(t *testing.T) {
 	}
 }
 
-// TestBuildToolCallFromNameAndArgs_UnknownVariant_NoPanic probes
-// reconstructing a tool call from an unrecognized/adversarial field name
-// (as could arrive from a malicious or buggy client sending a fabricated
-// tool_calls[].function.name in a follow-up request).
-func TestBuildToolCallFromNameAndArgs_UnknownVariant_NoPanic(t *testing.T) {
+// TestBuildToolCallFromNameAndArgs_NonNativeName_BecomesMcpToolCall
+// verifies that a tool name which is NOT one of Cursor's native variants
+// is treated as a client-declared tool and rebuilt as Cursor's generic
+// mcp_tool_call wrapper (that is how Cursor invokes client tools, and how
+// translate_response.go surfaces them), rather than being rejected. An
+// earlier version errored with "unknown tool call variant" here, which
+// broke the tool-result half of the round trip for every
+// client-declared tool - found in a live run on 2026-08-19.
+func TestBuildToolCallFromNameAndArgs_NonNativeName_BecomesMcpToolCall(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
-			t.Fatalf("buildToolCallFromNameAndArgs panicked on an unknown variant: %v", r)
+			t.Fatalf("buildToolCallFromNameAndArgs panicked on a client-declared tool name: %v", r)
 		}
 	}()
-	_, err := buildToolCallFromNameAndArgs("totally_made_up_tool_call", `{}`, "")
-	if err == nil {
-		t.Errorf("expected an error for an unknown tool call variant, got nil")
+
+	tc, err := buildToolCallFromNameAndArgs("get_weather", `{"city":"Seoul"}`, "sunny, 21C")
+	if err != nil {
+		t.Fatalf("buildToolCallFromNameAndArgs failed for a client-declared tool: %v", err)
+	}
+	mcpCall := tc.GetMcpToolCall()
+	if mcpCall == nil {
+		t.Fatalf("expected a client-declared tool to become an McpToolCall, got %+v", tc.GetTool())
+	}
+	if mcpCall.GetArgs().GetName() != "get_weather" {
+		t.Errorf("McpArgs.Name = %q, want %q", mcpCall.GetArgs().GetName(), "get_weather")
+	}
+	city, ok := mcpCall.GetArgs().GetArgs()["city"]
+	if !ok {
+		t.Fatalf("expected the city argument to be carried into McpArgs.Args, got %+v", mcpCall.GetArgs().GetArgs())
+	}
+	// Argument values are serialized google.protobuf.Value, matching how
+	// Cursor itself encodes them (mcpArgsToJSON decodes the same way), so
+	// decode before asserting rather than comparing raw bytes.
+	var cityValue structpb.Value
+	if err := proto.Unmarshal(city, &cityValue); err != nil {
+		t.Fatalf("McpArgs.Args[city] is not a serialized google.protobuf.Value: %v", err)
+	}
+	if cityValue.GetStringValue() != "Seoul" {
+		t.Errorf("decoded McpArgs.Args[city] = %q, want %q", cityValue.GetStringValue(), "Seoul")
+	}
+
+	// And the full round trip back out must produce clean JSON with no
+	// protobuf framing leaking into it.
+	argsJSON, err := mcpArgsToJSON(mcpCall.GetArgs().GetArgs())
+	if err != nil {
+		t.Fatalf("mcpArgsToJSON failed: %v", err)
+	}
+	if argsJSON != `{"city":"Seoul"}` {
+		t.Errorf("round-tripped args JSON = %s, want %s", argsJSON, `{"city":"Seoul"}`)
+	}
+	if mcpCall.GetResult() == nil {
+		t.Errorf("expected the supplied tool result to be encoded, got none")
 	}
 }
 

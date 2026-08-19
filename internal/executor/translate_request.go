@@ -409,7 +409,16 @@ func buildToolCallFromNameAndArgs(fieldName, argsJSON, resultContent string) (*g
 
 	fieldDesc := oneofDesc.Fields().ByName(protoreflect.Name(fieldName))
 	if fieldDesc == nil {
-		return nil, fmt.Errorf("cursor: unknown tool call variant %q", fieldName)
+		// Not one of Cursor's own native tool variants, so this is a tool
+		// the CLIENT declared via tools[] (see buildMcpTools): Cursor
+		// invokes those through the generic mcp_tool_call wrapper, and
+		// translate_response.go surfaces them to the client under their
+		// own declared name (McpArgs.Name). Round-tripping a result for
+		// such a tool therefore has to rebuild that same wrapper rather
+		// than fail - a live run (2026-08-19) showed this path erroring
+		// with "unknown tool call variant" for every client-declared
+		// tool, which broke the tool-result half of the round trip.
+		return buildMcpToolCallFromNameAndArgs(fieldName, argsJSON, resultContent)
 	}
 	if fieldDesc.Message() == nil {
 		return nil, fmt.Errorf("cursor: tool call variant %q is not a message field", fieldName)
@@ -430,6 +439,52 @@ func buildToolCallFromNameAndArgs(fieldName, argsJSON, resultContent string) (*g
 
 	reflectMsg.Set(fieldDesc, protoreflect.ValueOfMessage(concreteMsg))
 	return toolCall, nil
+}
+
+// buildMcpToolCallFromNameAndArgs rebuilds Cursor's generic
+// mcp_tool_call wrapper for a tool the CLIENT declared via tools[]. The
+// declared tool name goes back into McpArgs.Name (mirroring how
+// translate_response.go's toChatToolCall surfaced it), the JSON arguments
+// object is split back into McpArgs.Args's per-parameter raw-JSON map,
+// and any client-supplied tool result is written through the same generic
+// result-field walker used for Cursor's native tools.
+func buildMcpToolCallFromNameAndArgs(toolName, argsJSON, resultContent string) (*gen.ToolCall, error) {
+	mcpArgs := &gen.McpArgs{Name: toolName}
+
+	if strings.TrimSpace(argsJSON) != "" {
+		var decoded map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(argsJSON), &decoded); err != nil {
+			return nil, fmt.Errorf("cursor: failed to decode arguments for client tool %q: %w", toolName, err)
+		}
+		if len(decoded) > 0 {
+			mcpArgs.Args = make(map[string][]byte, len(decoded))
+			for key, value := range decoded {
+				// Symmetric with mcpArgsToJSON's decode: Cursor expects
+				// each argument value as a serialized
+				// google.protobuf.Value, not raw JSON bytes.
+				structValue, errValue := toolParametersToStructValue(json.RawMessage(value))
+				if errValue != nil {
+					return nil, fmt.Errorf("cursor: failed to encode argument %q for client tool %q: %w", key, toolName, errValue)
+				}
+				encoded, errMarshal := proto.Marshal(structValue)
+				if errMarshal != nil {
+					return nil, fmt.Errorf("cursor: failed to marshal argument %q for client tool %q: %w", key, toolName, errMarshal)
+				}
+				mcpArgs.Args[key] = encoded
+			}
+		}
+	}
+
+	mcpToolCall := &gen.McpToolCall{Args: mcpArgs}
+	if resultContent != "" {
+		if err := setGenericResultField(mcpToolCall.ProtoReflect(), resultContent, 0); err != nil {
+			return nil, fmt.Errorf("cursor: failed to set tool result for client tool %q: %w", toolName, err)
+		}
+	}
+
+	return &gen.ToolCall{
+		Tool: &gen.ToolCall_McpToolCall{McpToolCall: mcpToolCall},
+	}, nil
 }
 
 // maxResultDescendDepth bounds the recursive oneof descent in

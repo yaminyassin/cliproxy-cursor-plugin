@@ -220,24 +220,74 @@ func handleExecutorExecuteStream(ctx context.Context, request []byte) ([]byte, e
 
 	// Drain the channel into a JSON-serializable envelope response; the
 	// C ABI's executor.execute_stream method returns the full chunk set
-	// in one envelope (matching examples/plugin/simple/go/main.go's
-	// streamResponse{Chunks: []ExecutorStreamChunk} shape), not a
-	// separate host-native streaming transport.
+	// in one envelope, decoded host-side into
+	// []pluginapi.ExecutorStreamChunk (see rpcExecutorStreamResponse in
+	// the host's internal/pluginhost/rpc_schema.go).
+	//
+	// CRITICAL: pluginapi.ExecutorStreamChunk is declared as
+	//
+	//	type ExecutorStreamChunk struct {
+	//		Payload []byte
+	//		Err     error
+	//	}
+	//
+	// with NO json tags, so the host decodes the field names "Payload"
+	// and "Err" case-insensitively. `Err` is a bare `error` INTERFACE,
+	// which encoding/json can never unmarshal into: emitting any non-null
+	// "err"/"Err" value makes the host's decode of the whole result fail
+	// with `cannot unmarshal string into Go struct field
+	// ExecutorStreamChunk.chunks.Err of type error`. The host then treats
+	// that as a plugin failure, fuses the plugin, and every subsequent
+	// request fails with `auth_unavailable` until the plugin is unloaded.
+	//
+	// A real live E2E run (2026-08-19) hit exactly this: any streaming
+	// request whose stream carried an error chunk 500'd and took the whole
+	// plugin down, which is why every gjc session failed (gjc always
+	// sends stream:true) while non-streaming curl requests passed.
+	//
+	// The wire format therefore cannot carry a chunk-level error at all.
+	// Errors are surfaced the same way the streaming body itself is: as a
+	// terminal SSE-shaped error payload chunk, so the downstream client
+	// still sees an explicit failure (fail loud, never silently truncate)
+	// without corrupting the host's decode.
 	type chunkPayload struct {
 		Payload []byte `json:"payload,omitempty"`
-		Err     string `json:"err,omitempty"`
 	}
 	var chunks []chunkPayload
 	for chunk := range streamResp.Chunks {
-		cp := chunkPayload{Payload: chunk.Payload}
-		if chunk.Err != nil {
-			cp.Err = chunk.Err.Error()
+		if len(chunk.Payload) > 0 {
+			chunks = append(chunks, chunkPayload{Payload: chunk.Payload})
 		}
-		chunks = append(chunks, cp)
+		if chunk.Err != nil {
+			chunks = append(chunks, chunkPayload{Payload: streamErrorPayload(chunk.Err)})
+		}
 	}
 	return okEnvelope(struct {
 		Chunks []chunkPayload `json:"chunks,omitempty"`
 	}{Chunks: chunks})
+}
+
+// streamErrorPayload renders a stream error as an SSE-shaped
+// chat-completions error event, the only way a mid-stream failure can
+// reach the downstream client given pluginapi.ExecutorStreamChunk.Err
+// cannot cross the C ABI JSON boundary (see handleExecutorExecuteStream).
+func streamErrorPayload(err error) []byte {
+	body, marshalErr := json.Marshal(struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}{Error: struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	}{Message: err.Error(), Type: "cursor_stream_error"}})
+	if marshalErr != nil {
+		body = []byte(`{"error":{"message":"cursor: stream failed","type":"cursor_stream_error"}}`)
+	}
+	// No "data: " prefix here: CLIProxyAPI adds the SSE framing around
+	// each chunk payload itself (a live run showed "data: data: {...}"
+	// when this function added its own prefix).
+	return body
 }
 
 func handleExecutorCountTokens(ctx context.Context, request []byte) ([]byte, error) {

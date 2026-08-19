@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -62,7 +63,11 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 // handling in stream.go, which returns whatever was accumulated
 // alongside the error rather than discarding it.
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
-	chunks := make(chan pluginapi.ExecutorStreamChunk, 1)
+	// Buffered for every chunk this method can emit without a reader
+	// (content chunk + terminal chunk, or a single error chunk). The
+	// channel is closed before returning, so the buffer must hold them
+	// all or this would deadlock on its own send.
+	chunks := make(chan pluginapi.ExecutorStreamChunk, 4)
 
 	resp, errRun := e.run(ctx, req)
 	if errRun != nil {
@@ -71,14 +76,23 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 		return pluginapi.ExecutorStreamResponse{Chunks: chunks}, nil
 	}
 
-	payload, errMarshal := json.Marshal(resp)
-	if errMarshal != nil {
-		chunks <- pluginapi.ExecutorStreamChunk{Err: fmt.Errorf("cursor: failed to marshal chat-completions response: %w", errMarshal)}
-		close(chunks)
-		return pluginapi.ExecutorStreamResponse{Chunks: chunks}, nil
+	// Emit the OpenAI *streaming* chunk sequence (object ==
+	// "chat.completion.chunk" with choices[].delta), not the
+	// non-streaming chat.completion object. A streaming client parses
+	// delta and ignores message, so sending the non-streaming shape on an
+	// SSE stream makes it accumulate nothing and report an empty response
+	// (found in a live run on 2026-08-19). Each chunk is a separate
+	// payload so the host frames them as separate SSE events.
+	streamChunks := resp.toStreamChunks()
+	for _, streamChunk := range streamChunks {
+		payload, errMarshal := json.Marshal(streamChunk)
+		if errMarshal != nil {
+			chunks <- pluginapi.ExecutorStreamChunk{Err: fmt.Errorf("cursor: failed to marshal chat-completions chunk: %w", errMarshal)}
+			close(chunks)
+			return pluginapi.ExecutorStreamResponse{Chunks: chunks}, nil
+		}
+		chunks <- pluginapi.ExecutorStreamChunk{Payload: payload}
 	}
-
-	chunks <- pluginapi.ExecutorStreamChunk{Payload: payload}
 	close(chunks)
 	return pluginapi.ExecutorStreamResponse{Chunks: chunks}, nil
 }
@@ -140,6 +154,21 @@ func (e *Executor) run(ctx context.Context, req pluginapi.ExecutorRequest) (chat
 		}
 	}
 
+	if streamResult != nil {
+		if errCaptured := acc.addCapturedToolRequests(streamResult.toolRequests); errCaptured != nil {
+			return chatCompletionsResponse{}, errCaptured
+		}
+	}
+
+	// promptText is used only to estimate prompt tokens for the usage
+	// block (Cursor reports no input-token count); every message's text
+	// contributes, matching what was actually sent upstream.
+	var promptBuilder strings.Builder
+	for _, m := range chatReq.Messages {
+		promptBuilder.WriteString(m.Content)
+	}
+	promptText := promptBuilder.String()
+
 	if errStream != nil {
 		if len(acc.toolCalls) == 0 && acc.text.Len() == 0 {
 			// Nothing was salvaged before the failure; surface it as a
@@ -150,10 +179,10 @@ func (e *Executor) run(ctx context.Context, req pluginapi.ExecutorRequest) (chat
 		// return it with the terminal error attached rather than
 		// silently discarding what Cursor already sent, per the
 		// fail-loud / never-silently-truncate principle.
-		resp := acc.toChatCompletionsResponse(chatReq.Model, responseID)
+		resp := acc.toChatCompletionsResponse(chatReq.Model, responseID, promptText)
 		resp.Error = &chatErrorInfo{Message: errStream.Error(), Type: "cursor_stream_error"}
 		return resp, nil
 	}
 
-	return acc.toChatCompletionsResponse(chatReq.Model, responseID), nil
+	return acc.toChatCompletionsResponse(chatReq.Model, responseID, promptText), nil
 }

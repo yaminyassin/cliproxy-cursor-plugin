@@ -35,7 +35,7 @@ import (
 // hand-writing each of the 16 cases, mirroring the same generic approach
 // used for tool-call extraction/reconstruction in translate_response.go/
 // translate_request.go.
-func handleExecServerMessage(execMsg *gen.ExecServerMessage, kv *kvWriter) error {
+func handleExecServerMessage(execMsg *gen.ExecServerMessage, kv *kvWriter, result *runStreamResult) error {
 	reflectMsg := execMsg.ProtoReflect()
 	oneofDesc := reflectMsg.Descriptor().Oneofs().ByName("message")
 	if oneofDesc == nil {
@@ -48,6 +48,24 @@ func handleExecServerMessage(execMsg *gen.ExecServerMessage, kv *kvWriter) error
 	}
 
 	argsFieldName := string(whichField.Name())
+
+	// Capture a client-declared tool invocation BEFORE declining it, so
+	// the tool name and arguments can be surfaced to the local client as
+	// a real chat-completions tool_calls entry. Cursor never repeats them
+	// on the ToolCallCompleted update that follows a decline, so this is
+	// the only point at which they are observable
+	// (fact-r5-tool-roundtrip: the client is the acting agent, so it must
+	// receive the actual tool name it declared, not Cursor's internal
+	// wrapper name).
+	if mcpExec, isMCP := execMsg.GetMessage().(*gen.ExecServerMessage_McpArgs); isMCP && result != nil {
+		if args := mcpExec.McpArgs; args != nil && args.GetName() != "" {
+			result.toolRequests = append(result.toolRequests, capturedToolRequest{
+				Name: args.GetName(),
+				Args: args.GetArgs(),
+			})
+		}
+	}
+
 	if argsFieldName == "request_context_args" {
 		return sendExecClientMessage(kv, execMsg, "request_context_result", buildMinimalRequestContextResult())
 	}

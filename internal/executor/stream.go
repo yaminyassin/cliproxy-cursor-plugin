@@ -82,6 +82,25 @@ func parseConnectEndStream(data []byte) error {
 // truncates multi-message turns), until TurnEnded or the stream closes.
 type runStreamResult struct {
 	updates []*gen.InteractionUpdate
+	// toolRequests holds client-declared tool invocations that Cursor
+	// asked THIS process to execute inline via ExecServerMessage. Cursor
+	// only carries the tool name and arguments on that exec request; the
+	// ToolCallCompleted update that follows a decline carries just the
+	// rejection result. Since this plugin never executes tools itself
+	// (fact-r5-tool-roundtrip) and must instead surface them to the local
+	// client, the request details are captured here before being declined
+	// upstream - otherwise the tool name and arguments are lost entirely
+	// and the client receives an undispatchable "mcp_tool_call" with only
+	// a rejection payload (observed live on 2026-08-19).
+	toolRequests []capturedToolRequest
+}
+
+// capturedToolRequest is one client-declared tool invocation Cursor
+// requested inline, preserved for translation into a chat-completions
+// tool_calls entry.
+type capturedToolRequest struct {
+	Name string
+	Args map[string][]byte
 }
 
 // runCursorStream performs the real bidirectional Run exchange: opens an
@@ -208,7 +227,7 @@ func (c *AgentClient) runCursorStream(ctx context.Context, baseURL, accessToken 
 				// continues (see execmessage.go doc comment) - unlike
 				// the other default-branch cases below, silently
 				// ignoring this can hang the exchange.
-				if errExec := handleExecServerMessage(msg.ExecServerMessage, kv); errExec != nil {
+				if errExec := handleExecServerMessage(msg.ExecServerMessage, kv, result); errExec != nil {
 					return result, fmt.Errorf("cursor: failed to answer exec message: %w", errExec)
 				}
 			default:
