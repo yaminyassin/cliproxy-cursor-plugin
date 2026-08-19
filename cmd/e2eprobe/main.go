@@ -12,6 +12,15 @@
 //	go run ./cmd/e2eprobe chat "your message here"
 //	go run ./cmd/e2eprobe models
 //
+// login blocks in a single process until the browser login completes or
+// times out - internal/auth.Poller's pending-attempt state (the PKCE
+// verifier) is intentionally process-lifetime/in-memory only, matching
+// production (a real host process stays running across StartLogin ->
+// PollLogin calls), so login and the poll loop that follows it MUST run
+// in the same process; a prior version of this tool split them into
+// separate `go run` invocations, which cannot work by the same design
+// that makes the production code correct - not a bug in the plugin.
+//
 // State (tokens) persists to .e2eprobe-state.json in the current
 // directory between invocations, gitignored.
 package main
@@ -34,20 +43,18 @@ import (
 const stateFile = ".e2eprobe-state.json"
 
 // probeState is this tool's own on-disk persistence (not the plugin's
-// production auth-file format), just enough to carry a poll attempt id
-// across the login/wait invocations and the resulting AuthData across
-// login/chat/models invocations.
+// production auth-file format) for the resulting tokens, carried across
+// separate chat/models invocations after a completed login.
 type probeState struct {
 	AuthID      string    `json:"auth_id"`
 	AccessToken string    `json:"access_token"`
 	StorageJSON string    `json:"storage_json"`
 	ExpiresAt   time.Time `json:"expires_at"`
-	PendingUUID string    `json:"pending_uuid,omitempty"`
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: e2eprobe <login|wait|chat|models> [args]")
+		fmt.Fprintln(os.Stderr, "usage: e2eprobe <login|chat|models> [args]")
 		os.Exit(1)
 	}
 
@@ -61,9 +68,7 @@ func main() {
 
 	switch os.Args[1] {
 	case "login":
-		cmdLogin(ctx, authProvider)
-	case "wait":
-		cmdWait(ctx, authProvider, accounts)
+		cmdLogin(ctx, authProvider, accounts)
 	case "chat":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "usage: e2eprobe chat \"message\" [model-id]")
@@ -74,6 +79,12 @@ func main() {
 			model = os.Args[3]
 		}
 		cmdChat(ctx, exec, accounts, os.Args[2], model)
+	case "conv":
+		model := ""
+		if len(os.Args) >= 3 {
+			model = os.Args[2]
+		}
+		cmdConv(ctx, exec, accounts, model)
 	case "models":
 		cmdModels(ctx, disc, accounts)
 	default:
@@ -82,34 +93,30 @@ func main() {
 	}
 }
 
-func cmdLogin(ctx context.Context, authProvider *auth.Provider) {
-	resp, err := authProvider.StartLogin(ctx, pluginapi.AuthLoginStartRequest{})
+// cmdLogin runs the real StartLogin -> poll loop -> PollLogin(success)
+// sequence entirely within this one process invocation, using the
+// plugin's actual production auth.Provider code. This blocks (printing a
+// progress dot every 5s, matching the host-conformant poll interval)
+// until the browser login completes, times out at the 15-minute
+// host-conformant ceiling, or Cursor rejects the attempt.
+func cmdLogin(ctx context.Context, authProvider *auth.Provider, accounts *account.Store) {
+	startResp, err := authProvider.StartLogin(ctx, pluginapi.AuthLoginStartRequest{})
 	if err != nil {
 		fatalf("StartLogin failed: %v", err)
 	}
 	fmt.Println("Open this URL in a browser and complete the Cursor login:")
 	fmt.Println()
-	fmt.Println(resp.URL)
+	fmt.Println(startResp.URL)
 	fmt.Println()
-	fmt.Printf("Login expires at: %s\n", resp.ExpiresAt.Format(time.RFC3339))
+	fmt.Printf("Login expires at: %s\n", startResp.ExpiresAt.Format(time.RFC3339))
 	fmt.Println()
-	fmt.Println("Then run: go run ./cmd/e2eprobe wait")
+	fmt.Println("Waiting for login completion (host-conformant: 5s interval, 15min ceiling)...")
 
-	saveState(probeState{PendingUUID: resp.State})
-}
-
-func cmdWait(ctx context.Context, authProvider *auth.Provider, accounts *account.Store) {
-	st := loadState()
-	if st.PendingUUID == "" {
-		fatalf("no pending login attempt found; run 'e2eprobe login' first")
-	}
-
-	fmt.Println("Polling Cursor for login completion (host-conformant: 5s interval, 15min ceiling)...")
 	deadline := time.Now().Add(15 * time.Minute)
 	for time.Now().Before(deadline) {
-		resp, err := authProvider.PollLogin(ctx, pluginapi.AuthLoginPollRequest{State: st.PendingUUID})
-		if err != nil {
-			fatalf("PollLogin failed: %v", err)
+		resp, errPoll := authProvider.PollLogin(ctx, pluginapi.AuthLoginPollRequest{State: startResp.State})
+		if errPoll != nil {
+			fatalf("PollLogin failed: %v", errPoll)
 		}
 		switch resp.Status {
 		case pluginapi.AuthLoginStatusPending:
@@ -191,10 +198,62 @@ func cmdChat(ctx context.Context, exec *executor.Executor, accounts *account.Sto
 	fmt.Println(string(resp.Payload))
 }
 
+// cmdConv sends a hardcoded multi-turn conversation (user, assistant,
+// user) in ONE Execute call, proving rootPromptMessagesJson genuinely
+// reaches Cursor's model prompt construction within a single request -
+// unlike cmdChat's independent single-message calls, this tests whether
+// the model actually uses prior turns supplied in the same
+// AgentRunRequest, matching what
+// TestBuildAgentRunRequest_RootPromptMessagesJson verifies at the wire
+// level but cannot prove against the real backend.
+func cmdConv(ctx context.Context, exec *executor.Executor, accounts *account.Store, model string) {
+	st := requireLoggedIn()
+	restoreAccount(accounts, st)
+
+	if model == "" {
+		model = "gpt-5-mini"
+	}
+
+	payload := map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "user", "content": "My favorite number is 7. Just acknowledge it in one short sentence."},
+			{"role": "assistant", "content": "Got it — your favorite number is 7."},
+			{"role": "user", "content": "What is my favorite number plus 100?"},
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		fatalf("failed to marshal request: %v", err)
+	}
+
+	fmt.Printf("Sending a 3-message conversation to Cursor (model=%s) in ONE request:\n", model)
+	fmt.Println(`  1. user: "My favorite number is 7. Just acknowledge it in one short sentence."`)
+	fmt.Println(`  2. assistant: "Got it — your favorite number is 7."`)
+	fmt.Println(`  3. user: "What is my favorite number plus 100?"`)
+	fmt.Println()
+
+	start := time.Now()
+	resp, err := exec.Execute(ctx, pluginapi.ExecutorRequest{
+		AuthID:  st.AuthID,
+		Model:   model,
+		Payload: raw,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		fatalf("Execute failed (real Cursor backend call): %v", err)
+	}
+
+	fmt.Printf("Response received in %s:\n\n", elapsed.Round(time.Millisecond))
+	fmt.Println(string(resp.Payload))
+	fmt.Println()
+	fmt.Println("If the response correctly says 107 (or otherwise references 7 from turn 1), rootPromptMessagesJson genuinely reached Cursor's model prompt construction within this single request.")
+}
+
 func requireLoggedIn() probeState {
 	st := loadState()
 	if st.AuthID == "" || st.AccessToken == "" {
-		fatalf("not logged in; run 'e2eprobe login' then 'e2eprobe wait' first")
+		fatalf("not logged in; run 'e2eprobe login' first")
 	}
 	return st
 }
