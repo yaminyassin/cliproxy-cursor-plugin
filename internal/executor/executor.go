@@ -155,7 +155,7 @@ func (e *Executor) run(ctx context.Context, req pluginapi.ExecutorRequest) (chat
 	}
 
 	if streamResult != nil {
-		if errCaptured := acc.addCapturedToolRequests(streamResult.toolRequests); errCaptured != nil {
+		if errCaptured := acc.addCapturedToolRequests(streamResult.toolRequests, newClientToolIndex(chatReq.Tools)); errCaptured != nil {
 			return chatCompletionsResponse{}, errCaptured
 		}
 	}

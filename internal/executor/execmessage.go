@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
 
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/router-for-me/cliproxy-cursor-plugin/internal/cursorpb/gen"
@@ -57,12 +59,27 @@ func handleExecServerMessage(execMsg *gen.ExecServerMessage, kv *kvWriter, resul
 	// (fact-r5-tool-roundtrip: the client is the acting agent, so it must
 	// receive the actual tool name it declared, not Cursor's internal
 	// wrapper name).
-	if mcpExec, isMCP := execMsg.GetMessage().(*gen.ExecServerMessage_McpArgs); isMCP && result != nil {
-		if args := mcpExec.McpArgs; args != nil && args.GetName() != "" {
-			result.toolRequests = append(result.toolRequests, capturedToolRequest{
-				Name: args.GetName(),
-				Args: args.GetArgs(),
-			})
+	if result != nil {
+		if mcpExec, isMCP := execMsg.GetMessage().(*gen.ExecServerMessage_McpArgs); isMCP {
+			if args := mcpExec.McpArgs; args != nil && args.GetName() != "" {
+				result.toolRequests = append(result.toolRequests, capturedToolRequest{
+					Field: argsFieldName,
+					Name:  args.GetName(),
+					Args:  args.GetArgs(),
+				})
+			}
+		} else if argsFieldName != "request_context_args" {
+			// A NATIVE Cursor tool (read/glob/shell/...). Capture it too:
+			// if the client declared an equivalent tool, the executor maps
+			// it onto that name so the call is dispatchable instead of
+			// merely declined (see toolmap.go). Unmapped native tools are
+			// dropped by the executor, preserving prior behavior.
+			if argsJSON, ok := nativeToolArgsJSON(reflectMsg, whichField); ok {
+				result.toolRequests = append(result.toolRequests, capturedToolRequest{
+					Field:    argsFieldName,
+					ArgsJSON: argsJSON,
+				})
+			}
 		}
 	}
 
@@ -217,4 +234,49 @@ func sendExecClientMessage(kv *kvWriter, execMsg *gen.ExecServerMessage, resultF
 	return kv.write(&gen.AgentClientMessage{
 		Message: &gen.AgentClientMessage_ExecClientMessage{ExecClientMessage: clientMsg},
 	})
+}
+
+// nativeToolArgsJSON renders a native exec request's argument message as
+// JSON for the client-facing tool_calls entry. Cursor wraps the real
+// parameters one level deep for some tools (e.g. ShellArgs{...} inside
+// the exec message), so the returned JSON is the args message itself,
+// which is the closest shape to what an equivalent client tool expects.
+func nativeToolArgsJSON(reflectMsg protoreflect.Message, field protoreflect.FieldDescriptor) (string, bool) {
+	if field.Message() == nil {
+		return "", false
+	}
+	value := reflectMsg.Get(field)
+	if !value.Message().IsValid() {
+		return "", false
+	}
+	raw, err := protojson.MarshalOptions{EmitUnpopulated: false}.Marshal(value.Message().Interface())
+	if err != nil {
+		return "", false
+	}
+	return stripInternalArgFields(raw), true
+}
+
+// internalArgFields are Cursor bookkeeping fields that must not reach the
+// client's tool arguments. toolCallId in particular carries Cursor's raw
+// correlation id (observed containing an embedded newline), which is
+// meaningless to the client and pollutes an otherwise clean argument
+// object.
+var internalArgFields = []string{"toolCallId", "tool_call_id", "execId", "exec_id"}
+
+// stripInternalArgFields removes Cursor-internal keys from a native tool's
+// argument JSON, leaving only parameters a client tool can act on. On any
+// parse problem the input is returned unchanged rather than dropped.
+func stripInternalArgFields(raw []byte) string {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return string(raw)
+	}
+	for _, key := range internalArgFields {
+		delete(obj, key)
+	}
+	rendered, err := json.Marshal(obj)
+	if err != nil {
+		return string(raw)
+	}
+	return string(rendered)
 }

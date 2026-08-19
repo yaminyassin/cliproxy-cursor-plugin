@@ -102,8 +102,17 @@ type runStreamResult struct {
 // requested inline, preserved for translation into a chat-completions
 // tool_calls entry.
 type capturedToolRequest struct {
+	// Field is Cursor's own exec oneof field name (e.g. "mcp_args",
+	// "read_args"), used to map a NATIVE tool onto whichever equivalent
+	// tool the client declared (see toolmap.go).
+	Field string
+	// Name/Args are set for mcp_args: a tool the client declared, whose
+	// name and per-parameter values Cursor echoes back verbatim.
 	Name string
 	Args map[string][]byte
+	// ArgsJSON is set for native tools: protojson of Cursor's own args
+	// message, already unwrapped from its "args" envelope.
+	ArgsJSON string
 }
 
 // maxStreamAttempts bounds how many times one logical Run exchange is

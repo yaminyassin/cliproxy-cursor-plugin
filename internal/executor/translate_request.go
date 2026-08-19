@@ -35,7 +35,7 @@ const mcpToolsProviderIdentifier = "cliproxy-cursor-plugin"
 // happens) but wastes a full round trip and confuses the model's own
 // plan. Explicitly instructing the model up front to prefer/only use the
 // declared MCP tool set avoids that wasted round trip.
-const nativeToolsOnlyMcpSystemPrompt = "You have been given a specific set of tools for this conversation. Only call the tools explicitly provided to you; do not attempt to use any other built-in or native tools (such as shell, file read/write, glob, or grep) even if they appear to be available - those requests will always be declined."
+const nativeToolsOnlyMcpSystemPrompt = "Every tool you call is executed by the user's client, not by you. You may use your built-in file, search and shell tools - those calls are forwarded to the user's client for execution and their results are returned to you. Tools listed explicitly for you cover capabilities the client provides beyond those. Do not attempt screen recording, image generation, or computer-use tools; those are unavailable and will be declined."
 
 // buildAgentRunRequest translates a chat-completions request into a
 // Cursor AgentRunRequest. The last user message becomes the turn's
@@ -134,6 +134,17 @@ func buildMcpTools(tools []chatToolDefinition) (*gen.McpTools, error) {
 	defs := make([]*gen.McpToolDefinition, 0, len(tools))
 	for _, t := range tools {
 		if t.Function.Name == "" {
+			continue
+		}
+
+		// Deduplicate against Cursor's own native tools: if the client
+		// declared something Cursor already has natively (Read/Bash/Glob/
+		// Grep/...), declaring it AGAIN as an MCP tool gives the model two
+		// competing ways to do one thing and bloats the prompt. Rely on
+		// the native tool instead - translate_response.go maps that call
+		// back onto this client tool name (see toolmap.go), so the client
+		// still receives a call under its own name either way.
+		if _, hasNative := resolveCursorToolField(t.Function.Name); hasNative {
 			continue
 		}
 
@@ -408,6 +419,19 @@ func buildToolCallFromNameAndArgs(fieldName, argsJSON, resultContent string) (*g
 	}
 
 	fieldDesc := oneofDesc.Fields().ByName(protoreflect.Name(fieldName))
+	if fieldDesc == nil {
+		// The client may be returning a result for a NATIVE Cursor tool
+		// that was surfaced under the client's own equivalent tool name
+		// (see toolmap.go / addCapturedToolRequests). Map it back to the
+		// Cursor variant it came from before falling through to the
+		// declared-tool (mcp) path, so the result lands on the right
+		// tool instead of inventing an MCP tool Cursor never offered.
+		if nativeField, mapped := resolveCursorToolField(fieldName); mapped {
+			if nativeDesc := oneofDesc.Fields().ByName(protoreflect.Name(nativeField)); nativeDesc != nil && nativeDesc.Message() != nil {
+				fieldDesc = nativeDesc
+			}
+		}
+	}
 	if fieldDesc == nil {
 		// Not one of Cursor's own native tool variants, so this is a tool
 		// the CLIENT declared via tools[] (see buildMcpTools): Cursor

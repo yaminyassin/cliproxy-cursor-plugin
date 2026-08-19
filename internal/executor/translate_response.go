@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/router-for-me/cliproxy-cursor-plugin/internal/cursorpb/gen"
@@ -227,6 +228,19 @@ func toChatToolCall(toolCall *gen.ToolCall) (*chatToolCall, error) {
 		return nil, fmt.Errorf("cursor: tool call field %s has no message value", whichField.Name())
 	}
 
+	// Skip completion/decline ECHOES. After this plugin declines a native
+	// tool inline (fact-r5-tool-roundtrip), Cursor emits a
+	// ToolCallCompleted carrying only the rejection `result` and no
+	// `args`. Surfacing that as a tool_calls entry produced exactly the
+	// undispatchable "read_tool_call"/"glob_tool_call" entries a real
+	// client rejected on 2026-08-19, with a rejection payload sitting
+	// where the arguments belong. The actionable request was already
+	// captured from the exec channel and is surfaced from there
+	// (runStreamResult.toolRequests), so an args-less echo is pure noise.
+	if isToolCallCompletionEcho(fieldValue.Message()) {
+		return nil, nil
+	}
+
 	toolMessage := fieldValue.Message().Interface()
 	argsJSON, err := protojson.MarshalOptions{EmitUnpopulated: false}.Marshal(toolMessage)
 	if err != nil {
@@ -329,17 +343,47 @@ func newResponseID() (string, error) {
 }
 
 // addCapturedToolRequests folds tool invocations captured from Cursor's
-// inline exec channel into the accumulated tool_calls array, under the
-// client's own declared tool names.
-func (a *responseAccumulator) addCapturedToolRequests(requests []capturedToolRequest) error {
+// inline exec channel into the accumulated tool_calls array.
+//
+// Two kinds arrive here:
+//
+//   - Client-declared tools (mcp_args): Cursor echoes the client's own
+//     tool name and per-parameter values, so they pass through exactly.
+//   - Cursor NATIVE tools (read/glob/shell/...): surfaced only when the
+//     client declared an equivalent tool, remapped onto that declared
+//     name via the toolmap heuristic. Cursor's model reaches for its
+//     native tools even when the client declared its own set, and a live
+//     run on 2026-08-19 showed a real client rejecting every one of them
+//     ("Tool read_tool_call not found"). An unmatched native tool is
+//     dropped here and remains declined upstream, so this can only turn
+//     otherwise-dead calls into dispatchable ones.
+func (a *responseAccumulator) addCapturedToolRequests(requests []capturedToolRequest, tools *clientToolIndex) error {
 	for _, req := range requests {
-		if req.Name == "" {
-			continue
+		name := req.Name
+		argsJSON := ""
+
+		switch {
+		case name != "":
+			// Client-declared tool: exact name and schema.
+			rendered, err := mcpArgsToJSON(req.Args)
+			if err != nil {
+				return fmt.Errorf("cursor: failed to render arguments for tool %q: %w", name, err)
+			}
+			argsJSON = rendered
+		default:
+			// Native Cursor tool: only surface it if the client declared
+			// something equivalent to dispatch it with.
+			mapped, ok := tools.resolveClientTool(req.Field)
+			if !ok {
+				continue
+			}
+			name = mapped
+			argsJSON = req.ArgsJSON
+			if argsJSON == "" {
+				argsJSON = "{}"
+			}
 		}
-		argsJSON, err := mcpArgsToJSON(req.Args)
-		if err != nil {
-			return fmt.Errorf("cursor: failed to render arguments for tool %q: %w", req.Name, err)
-		}
+
 		callID, errID := newToolCallID()
 		if errID != nil {
 			return errID
@@ -347,8 +391,26 @@ func (a *responseAccumulator) addCapturedToolRequests(requests []capturedToolReq
 		a.toolCalls = append(a.toolCalls, chatToolCall{
 			ID:       callID,
 			Type:     "function",
-			Function: chatToolCallFunc{Name: req.Name, Arguments: argsJSON},
+			Function: chatToolCallFunc{Name: name, Arguments: argsJSON},
 		})
 	}
 	return nil
+}
+
+// isToolCallCompletionEcho reports whether a Cursor ToolCall variant is a
+// completion/decline echo rather than an actionable request: its schema
+// declares an `args` field but only `result` is populated.
+func isToolCallCompletionEcho(msg protoreflect.Message) bool {
+	fields := msg.Descriptor().Fields()
+	argsField := fields.ByName("args")
+	if argsField == nil {
+		return false
+	}
+	if msg.Has(argsField) {
+		return false
+	}
+	if resultField := fields.ByName("result"); resultField != nil && msg.Has(resultField) {
+		return true
+	}
+	return false
 }
