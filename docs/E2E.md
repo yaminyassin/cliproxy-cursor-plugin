@@ -53,19 +53,19 @@ gajae-code's `CURSOR_CLIENT_VERSION` at the time of writing
 (`internal/executor/client.go`) and should be re-verified/updated
 periodically, since Cursor gates backend features on this header.
 
-**Known remaining gap - client-facing streaming is still buffered, not
-incremental:** the exchange **between this plugin and Cursor** is now
-the real, fully bidirectional multi-message protocol described above.
-However, the exchange **between this plugin and the local
-chat-completions client** (CLIProxyAPI's own downstream consumer) is
-still fully buffered: `Executor.ExecuteStream`
+**Known remaining gap - client-facing streaming is buffered per turn,
+not token-by-token:** the exchange **between this plugin and Cursor** is
+the real, fully bidirectional multi-message protocol described above. The
+exchange **between this plugin and the local chat-completions client**
+now uses the correct OpenAI *streaming* wire format
+(`object: "chat.completion.chunk"` with `choices[].delta`, plus a
+terminal chunk carrying `finish_reason` and `usage`), so standard
+streaming clients parse it normally. What remains buffered is the
+*timing*, not the format: `Executor.ExecuteStream`
 (`internal/executor/executor.go`) waits for the entire Cursor turn to
-finish (or fail) before emitting anything, then returns exactly one
-chunk containing a complete `chat.completion`-shaped payload, not a
-sequence of incremental `chat.completion.chunk`/SSE delta events. A
-downstream client that expects true token-by-token streaming will
-instead see one long pause followed by the full response at once. This
-is a real, load-bearing scope limitation, not a cosmetic detail -
+finish (or fail) before emitting its chunks, so a client sees one pause
+followed by the whole answer rather than progressive tokens. This is a
+real scope limitation, not a cosmetic detail -
 verify it explicitly in Step 3 below rather than assuming the executor's
 internal protocol fix also fixed client-facing streaming (it did not;
 they are two separate layers).
@@ -134,10 +134,11 @@ Confirm:
   or erroring — this validates the real KV/exec handshakes against
   Cursor's actual backend, not just the local `h2c` test server.
 - With `"stream": true`, confirm the client-facing response arrives as a
-  single delayed payload rather than incremental chunks (this is the
-  documented buffered-streaming limitation above, not a bug — just
-  confirm it matches the documented behavior rather than silently
-  assuming true incremental streaming works).
+  correctly-formatted SSE stream (`chat.completion.chunk` events with
+  `delta`, then a terminal chunk with `finish_reason` and `usage`, then
+  `[DONE]`), but arriving all at once after a pause rather than
+  progressively. That timing behavior is the documented
+  buffered-per-turn limitation above, not a bug.
 
 ### 4. Multi-turn tool-using conversation
 
@@ -298,13 +299,68 @@ array on the request and asks Cursor's model to call it.
   (`nativeToolsOnlyMcpSystemPrompt`) telling the model to only call
   declared tools, never Cursor's native ones - skipped if the client's
   own system message already contains the identical instruction.
-- **Verified live, 2/2 runs**: Cursor's model correctly called the
-  declared custom `get_weather` tool via the `mcp_tool_call` path (not
-  any native tool like `shell_tool_call`) both times, proving
-  `McpTools` and the system instruction both genuinely reach the real
-  model, not just the wire encoding. The plugin correctly declined
-  in-plugin execution per fact-r5-tool-roundtrip and Cursor's model
-  handled the decline gracefully in both responses.
+- **CORRECTION (this entry was originally overstated).** The two runs
+  recorded here were executed against a **stale `cursor.dylib` built
+  before `buildMcpTools` existed**, so they did NOT prove the McpTools
+  wiring at all: the `mcp_tool_call` observed was Cursor's own
+  speculative behavior. Worse, surfacing a tool call as
+  `function.name: "mcp_tool_call"` is useless to a client, which can only
+  dispatch tools it actually declared. Genuine verification came later -
+  see the "six client-compatibility bugs" entry below.
+
+### 2026-08-19 (continued) — six client-compatibility bugs found by real client integration
+
+Running a real OpenAI-compatible client (`gjc`) against a real
+CLIProxyAPI host with this plugin loaded exposed six genuine plugin bugs
+that neither the mocked suite nor hand-written `curl` requests caught.
+Recorded here because each one is a lesson about what mocked tests and
+simplified manual requests cannot prove.
+
+1. **`execute_stream` `Err` serialization (critical, plugin-fusing).**
+   `pluginapi.ExecutorStreamChunk.Err` is a bare `error` interface with no
+   JSON tags, so `encoding/json` can never unmarshal into it. Emitting any
+   `err` field made the host fail to decode the entire result, which made
+   CLIProxyAPI **fuse** the plugin: every later request returned
+   `503 auth_unavailable` and the plugin was eventually unloaded. Chunk
+   errors are now surfaced as a terminal error payload chunk instead.
+   *This also explains log lines previously mis-attributed to shutdown.*
+2. **`content` array form rejected.** OpenAI allows
+   `"content": [{"type":"text",...}]`, but `Content` was a plain `string`,
+   so every request from a client using the content-parts form failed to
+   decode. Both forms are accepted now.
+3. **No `usage` block.** Clients reject responses with absent/all-zero
+   usage as anomalous ("empty response with anomalously low token
+   usage"). Usage is now always emitted, with completion tokens taken
+   from Cursor's own `TokenDelta` stream.
+4. **Client tool names discarded.** Cursor requests client-declared tools
+   through `ExecServerMessage{McpArgs{Name,Args}}`; the
+   `ToolCallCompleted` that follows a decline carries only the rejection.
+   The name/args are now captured from the exec request and surfaced
+   under the client's own declared name, making tool calls dispatchable.
+5. **`McpArgs` values are serialized `google.protobuf.Value`**, not raw
+   JSON. Treating them as text leaked wire bytes into client-facing JSON
+   (`{"city":"\u001a\u0005Seoul"}`). Encoded/decoded correctly both
+   directions; tool results now round-trip for client-declared tools
+   instead of failing with "unknown tool call variant".
+6. **Streaming used the non-streaming object shape.** Streaming clients
+   parse `choices[].delta` with `object == "chat.completion.chunk"`, so
+   sending a `chat.completion` object with `choices[].message` made them
+   accumulate nothing and report an empty response.
+
+**Verified live after the fixes:**
+
+- A real `gjc` session returns a correct answer:
+  `21 × 13 is 273.`
+- SSE format confirmed: `chat.completion.chunk` events with `delta`, then
+  a terminal chunk with `finish_reason` and `usage`.
+- **Full tool round trip with no declining, under the client's own tool
+  name:** client declares `get_weather` -> Cursor calls it as
+  `get_weather` with clean `{"city":"Seoul"}` -> client executes -> result
+  fed back as a `tool` message -> model answers *"The weather tool
+  reported 21 degrees Celsius."*
+- Plugin stays loaded and healthy across repeated streaming requests plus
+  the model registrar (no fuse), confirming bug 1 is resolved under load.
 
 This closes the "custom tool sets work with this plugin" question:
-before this change, no; after, yes, verified against the real backend.
+before, no; after these fixes, yes - verified against the real backend
+through a real client, not a probe.

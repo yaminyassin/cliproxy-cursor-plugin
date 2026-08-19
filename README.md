@@ -157,10 +157,12 @@ curl http://127.0.0.1:8317/v1/chat/completions \
   }'
 ```
 
-The model's tool call comes back as a standard `tool_calls` entry
-(`function.name: "mcp_tool_call"`) — your client is responsible for actually executing it and
-sending the result back as a `{"role": "tool", "tool_call_id": "...", "content": "..."}`
-message in the next request, exactly like OpenAI's own tool-calling contract.
+The model's tool call comes back as a standard `tool_calls` entry under **your own declared
+tool name** (e.g. `function.name: "get_weather"`) with clean JSON arguments. Your client is
+responsible for actually executing it and sending the result back as a
+`{"role": "tool", "tool_call_id": "...", "content": "..."}` message in the next request,
+exactly like OpenAI's own tool-calling contract. The plugin re-encodes that result into
+Cursor's protocol so the model can use it on the next turn.
 
 ## What's implemented
 
@@ -179,10 +181,11 @@ message in the next request, exactly like OpenAI's own tool-calling contract.
 
 ## Known limitations
 
-- **Client-facing streaming is buffered, not incremental.** The exchange between this plugin
-  and Cursor is fully bidirectional/streaming internally, but the response handed back to
-  your downstream client is currently one complete payload, not incremental SSE chunks. See
-  [`docs/E2E.md`](docs/E2E.md) for detail.
+- **Client-facing streaming is buffered per turn, not token-by-token.** The wire format is
+  correct OpenAI streaming (`object: "chat.completion.chunk"` with `choices[].delta` plus a
+  terminal `usage` chunk), so standard streaming clients parse it normally — but the full
+  Cursor turn completes before the first chunk is emitted, so you get the whole answer at
+  once rather than progressive tokens. See [`docs/E2E.md`](docs/E2E.md) for detail.
 - The plugin never executes tools itself, by design — native Cursor tool-execution requests
   (`ExecServerMessage`) are always declined so your own client stays the sole executor.
 - `x_cursor_client_version` reconfiguration via the Management API's `config_yaml` payload is
