@@ -238,8 +238,46 @@ just invoked from a smaller harness.
   (which the mocked `TestBuildAgentRunRequest_RootPromptMessagesJson`
   already proved at the encoding level).
 
-Not yet run in this pass: a native Cursor-tool-triggering conversation
-(Step 4's tool_calls / ExecServerMessage-decline paths) and a forced
-refresh failure (Step 5). Those remain open follow-up verification
-items; this entry covers login, discovery, and both single- and
-multi-turn chat translation against the real backend.
+Not yet run in this pass: a forced refresh failure (Step 5). That
+remains an open follow-up verification item; this entry covers login,
+discovery, and single-turn, multi-turn, and native-tool-triggering chat
+translation against the real backend.
+
+### 2026-08-19 (continued) — native-tool-triggering conversation
+
+Ran via `go run ./cmd/e2eprobe tool [model-id]` (new probe command),
+which sends a message that naturally prompts Cursor's model to request a
+native tool (listing files) and decodes the resulting `tool_calls`
+entries.
+
+- **First run**: Cursor genuinely requested 4 native tool calls
+  (3× `shell_tool_call`, 1× `glob_tool_call`) against the real backend.
+  The plugin correctly declined execution per fact-r5-tool-roundtrip via
+  the `ExecServerMessage`-decline path built during the boundary review,
+  `finish_reason: "tool_calls"` was correctly set, and multi-tool-call
+  batching into one array worked. Cursor's own model text adapted
+  correctly to the decline ("I can't run shell commands from here...").
+  **This run also surfaced a real defect**: Cursor's raw `call_id` for
+  these tool calls contained an embedded newline plus a second
+  concatenated internal id (e.g.
+  `"call_xyz\nfc_0e03a4cd..."`), which the plugin was passing straight
+  through into the chat-completions-facing `tool_calls[].id` field —
+  not a clean OpenAI-compatible opaque token.
+- **Fix**: `internal/executor/translate_response.go`'s `toChatToolCall`
+  now always generates a fresh `call_<hex>` id, decoupled entirely from
+  Cursor's raw `call_id` (verified safe: the tool-result round-trip in
+  `translate_request.go` reconstructs the Cursor `ToolCall` from
+  `Function.Name`/`Arguments` only, never from the client-facing `id`).
+- **Re-run after the fix**: Cursor requested 2 native `shell_tool_call`s
+  (tool invocation is model-decided, so the count varies per run); both
+  surfaced ids were clean, opaque, whitespace-free tokens
+  (`call_0e75067e50614632322416ffdaaab0c3`,
+  `call_3d203bee81b32c50fba7c13e7c4ee04a`), correctly declined, with
+  `finish_reason: "tool_calls"`.
+
+This is a concrete example of the two-tier verification strategy finding
+a real defect the mocked suite could not: the mocked
+`TestResponseAccumulator_BatchesMultipleToolCallsIntoOneArray` and
+`TestExecute_SingleToolCallRoundTrip` construct their own well-formed
+`CallId` fixtures and never exercised what Cursor's real backend
+actually sends.
