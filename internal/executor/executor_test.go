@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,6 +46,18 @@ type fakeCursorRunServer struct {
 	execRequestsRequiringReply []*gen.ExecServerMessage
 	receivedExecReplies        [][]byte
 	failMidStream              bool
+
+	// attempts counts requests the server actually saw, so a retry test
+	// can assert the second attempt reached it.
+	attemptMu sync.Mutex
+	attempts  int
+}
+
+// connectionAttempts reports how many requests the server has seen.
+func (f *fakeCursorRunServer) connectionAttempts() int {
+	f.attemptMu.Lock()
+	defer f.attemptMu.Unlock()
+	return f.attempts
 }
 
 func newFakeCursorRunServer(t *testing.T) *fakeCursorRunServer {
@@ -68,6 +81,10 @@ func newFakeCursorRunServer(t *testing.T) *fakeCursorRunServer {
 }
 
 func (f *fakeCursorRunServer) handle(w http.ResponseWriter, r *http.Request) {
+	f.attemptMu.Lock()
+	f.attempts++
+	f.attemptMu.Unlock()
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "flushing not supported", http.StatusInternalServerError)

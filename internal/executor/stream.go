@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -103,7 +105,92 @@ type capturedToolRequest struct {
 	Args map[string][]byte
 }
 
-// runCursorStream performs the real bidirectional Run exchange: opens an
+// maxStreamAttempts bounds how many times one logical Run exchange is
+// re-attempted after a retryable connection-level failure.
+const maxStreamAttempts = 3
+
+// runCursorStream performs the Run exchange, transparently re-attempting
+// it when the connection dies in a way that produced no content yet.
+//
+// Cursor's servers routinely cycle HTTP/2 connections with GOAWAY. Go's
+// http2 transport wants to retry such a request on a fresh connection,
+// but it refuses once the request body has been written and no
+// Request.GetBody is defined - surfacing:
+//
+//	http2: Transport received Server's graceful shutdown GOAWAY
+//	cannot retry err [...] after Request.Body was written;
+//	define Request.GetBody to avoid this error
+//
+// Defining GetBody is NOT a valid fix here: this exchange is duplex, so
+// the transport would hand itself a fresh body reader while kvWriter
+// still points at the old pipe, and every blob-handshake reply would be
+// written to a pipe nobody reads. The exchange has to be rebuilt from
+// scratch instead - which is safe, because the only unconditional write
+// is the initial AgentRunRequest frame (reproducible from runReq) and all
+// KV/exec replies are generated reactively against whatever the new
+// stream asks for. The shared blobStore is a content-addressed cache, so
+// it stays valid and warm across attempts.
+//
+// A retry is only attempted when nothing was accumulated yet; once any
+// update or tool request has been observed, the error is returned with
+// the partial result so a retry can never duplicate emitted content
+// (fail loud, never silently replay half a turn).
+func (c *AgentClient) runCursorStream(ctx context.Context, baseURL, accessToken string, runReq *gen.AgentRunRequest, blobs *blobStore) (*runStreamResult, error) {
+	var (
+		result *runStreamResult
+		err    error
+	)
+	for attempt := 1; attempt <= maxStreamAttempts; attempt++ {
+		result, err = c.runCursorStreamOnce(ctx, baseURL, accessToken, runReq, blobs)
+		if err == nil {
+			return result, nil
+		}
+
+		produced := result != nil && (len(result.updates) > 0 || len(result.toolRequests) > 0)
+		if produced || attempt == maxStreamAttempts || !isRetryableStreamError(err) {
+			return result, err
+		}
+
+		// Brief backoff before rebuilding the exchange, honoring ctx.
+		backoff := time.Duration(attempt) * 250 * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return result, err
+		case <-time.After(backoff):
+		}
+	}
+	return result, err
+}
+
+// isRetryableStreamError reports whether a failed Run exchange died from
+// a connection-level condition that a fresh connection is expected to
+// resolve. Deliberately narrow: request/protocol errors and Cursor's own
+// Connect-level errors must surface to the caller, not be retried.
+func isRetryableStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, signature := range []string{
+		"GOAWAY",
+		"graceful shutdown",
+		"cannot retry err",
+		"REFUSED_STREAM",
+		"connection reset by peer",
+		"use of closed network connection",
+		"broken pipe",
+		"unexpected EOF",
+		"server closed idle connection",
+		"http2: client connection lost",
+	} {
+		if strings.Contains(msg, signature) {
+			return true
+		}
+	}
+	return false
+}
+
+// runCursorStreamOnce performs ONE real bidirectional Run exchange: opens an
 // HTTP/2 duplex request, writes the initial AgentClientMessage carrying
 // the AgentRunRequest, then loops reading framed AgentServerMessages from
 // the response body. Any server-initiated KvServerMessage
@@ -120,7 +207,7 @@ type capturedToolRequest struct {
 // HandleMethod), which never cancels on its own, so waiting on
 // ctx.Done() to release the writer would leak one goroutine per request
 // forever.
-func (c *AgentClient) runCursorStream(ctx context.Context, baseURL, accessToken string, runReq *gen.AgentRunRequest, blobs *blobStore) (result *runStreamResult, resultErr error) {
+func (c *AgentClient) runCursorStreamOnce(ctx context.Context, baseURL, accessToken string, runReq *gen.AgentRunRequest, blobs *blobStore) (result *runStreamResult, resultErr error) {
 	clientMsg := &gen.AgentClientMessage{
 		Message: &gen.AgentClientMessage_RunRequest{RunRequest: runReq},
 	}
@@ -167,7 +254,21 @@ func (c *AgentClient) runCursorStream(ctx context.Context, baseURL, accessToken 
 		}
 		<-release
 	}()
+	// Defers run LIFO, so the effective order here is:
+	//   1. close(release)  - tell the writer it may stop waiting
+	//   2. pr.Close()      - unblock any write still parked on the pipe
+	//   3. <-writerExited  - only then wait for the goroutine to finish
+	//
+	// Step 2 is required for correctness, not tidiness: if the transport
+	// fails BEFORE consuming the request body (e.g. the connection is
+	// refused, or a GOAWAY retry is rejected outright), nothing ever
+	// drains the pipe, so the writer goroutine stays parked in pw.Write
+	// and waiting on writerExited deadlocks the whole call. Closing the
+	// read end makes that pending write fail immediately so the goroutine
+	// can exit. Caught by TestRunCursorStream_RetriesGoawayThenSucceeds,
+	// which injects a transport error before any body read.
 	defer func() { <-writerExited }()
+	defer pr.Close()
 	defer close(release)
 
 	resp, err := c.httpClient.Do(httpReq)
