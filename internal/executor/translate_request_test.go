@@ -404,3 +404,89 @@ func TestBuildAgentRunRequest_ToolsPresent_SkipsDuplicateInstructionIfClientAlre
 		t.Errorf("expected the native-tools-only instruction to appear exactly once (from the client's own system message, not duplicated), found %d times", found)
 	}
 }
+
+// TestBuildAgentRunRequest_ToolResultTailUsesResumeAndKeepsHistory pins the
+// agent-loop contract. When the client's final message is a TOOL RESULT
+// (the normal shape after it executed a tool), the request must:
+//
+//   - use a ResumeAction, not re-issue the original user question, and
+//   - keep the assistant tool call AND the tool result in history.
+//
+// The previous implementation selected the last USER message as the action
+// and dropped everything after it, so the model never saw tool results and
+// re-requested the same tool indefinitely: a live session ran 23 turns in 9
+// minutes on "read go.mod and tell me the module name" without converging.
+func TestBuildAgentRunRequest_ToolResultTailUsesResumeAndKeepsHistory(t *testing.T) {
+	blobs := newBlobStore()
+	req := chatCompletionsRequest{
+		Model: "cursor-fast",
+		Messages: []chatMessage{
+			{Role: "system", Content: "You are terse."},
+			{Role: "user", Content: "Read go.mod and tell me the module name."},
+			{Role: "assistant", ToolCalls: []chatToolCall{{
+				ID:       "call_1",
+				Type:     "function",
+				Function: chatToolCallFunc{Name: "shell_tool_call", Arguments: `{"args":{"command":"cat go.mod"}}`},
+			}}},
+			{Role: "tool", ToolCallID: "call_1", Content: "module example.com/thing"},
+		},
+	}
+
+	agentReq, err := buildAgentRunRequest(req, blobs, "conv-loop", nil)
+	if err != nil {
+		t.Fatalf("buildAgentRunRequest failed: %v", err)
+	}
+
+	// Must resume, not re-ask the original question.
+	if agentReq.GetAction().GetResumeAction() == nil {
+		t.Fatalf("expected a ResumeAction when the last message is a tool result, got %+v", agentReq.GetAction().GetAction())
+	}
+	if um := agentReq.GetAction().GetUserMessageAction(); um != nil {
+		t.Errorf("expected no UserMessageAction (that re-asks the question and loops), got %q", um.GetUserMessage().GetText())
+	}
+
+	// The tool result must actually reach the model via root prompt entries.
+	foundResult := false
+	for _, id := range agentReq.GetConversationState().GetRootPromptMessagesJson() {
+		raw, ok := blobs.get(id)
+		if !ok {
+			t.Fatalf("root prompt blob id not resolvable")
+		}
+		var entry rootPromptEntry
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			t.Fatalf("root prompt entry not valid JSON: %v", err)
+		}
+		for _, part := range entry.Content {
+			if strings.Contains(part.Text, "module example.com/thing") {
+				foundResult = true
+			}
+		}
+	}
+	if !foundResult {
+		t.Errorf("expected the tool result to reach the model through root_prompt_messages_json; it was dropped")
+	}
+}
+
+// TestBuildAgentRunRequest_NewUserTailStillUsesUserMessageAction verifies the
+// normal case is unchanged: a trailing user message is the action.
+func TestBuildAgentRunRequest_NewUserTailStillUsesUserMessageAction(t *testing.T) {
+	blobs := newBlobStore()
+	req := chatCompletionsRequest{
+		Model: "cursor-fast",
+		Messages: []chatMessage{
+			{Role: "user", Content: "first"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "second question"},
+		},
+	}
+	agentReq, err := buildAgentRunRequest(req, blobs, "conv-normal", nil)
+	if err != nil {
+		t.Fatalf("buildAgentRunRequest failed: %v", err)
+	}
+	if got := agentReq.GetAction().GetUserMessageAction().GetUserMessage().GetText(); got != "second question" {
+		t.Errorf("action text = %q, want %q", got, "second question")
+	}
+	if agentReq.GetAction().GetResumeAction() != nil {
+		t.Errorf("expected UserMessageAction for a trailing user message, got ResumeAction")
+	}
+}

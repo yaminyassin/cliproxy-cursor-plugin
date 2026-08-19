@@ -61,30 +61,63 @@ func buildAgentRunRequest(req chatCompletionsRequest, blobs *blobStore, conversa
 		return nil, fmt.Errorf("cursor: at least one message is required")
 	}
 
-	lastUserIdx := lastUserMessageIndex(req.Messages)
-	if lastUserIdx == -1 {
-		return nil, fmt.Errorf("cursor: no user message found in request")
-	}
+	// Split the conversation into "history" and "the action to run now".
+	//
+	// The action is NOT simply the last user message. In an agent loop the
+	// client's final message is a TOOL RESULT, e.g.
+	//
+	//	[system, user, assistant(tool_calls), tool(result)]
+	//
+	// Selecting the last *user* message there would re-issue the original
+	// question as the action and place everything after it outside history,
+	// silently discarding the assistant's tool call AND its result. The
+	// model would then never see the result and would request the same tool
+	// again, forever: a live session on 2026-08-19 ran 23 turns over 9
+	// minutes on "read go.mod and tell me the module name" without ever
+	// converging, for exactly this reason.
+	//
+	// Cursor's protocol expresses "continue, I have given you the tool
+	// results" as a ResumeAction, which is what gajae-code uses whenever
+	// there is no new user content (streamCursor: userMessageAction when
+	// user text/images exist, otherwise resumeAction). So:
+	//
+	//   - Last message is new user content -> UserMessageAction with it,
+	//     history is everything before it.
+	//   - Otherwise (tool result or assistant continuation) -> ResumeAction,
+	//     and history includes EVERY message so the tool call and its
+	//     result actually reach the model.
+	lastIdx := len(req.Messages) - 1
+	lastMsg := req.Messages[lastIdx]
 
-	messageID, err := newMessageID()
-	if err != nil {
-		return nil, err
-	}
+	var (
+		action  *gen.ConversationAction
+		history []chatMessage
+	)
 
-	userMessage := &gen.UserMessage{
-		Text:      req.Messages[lastUserIdx].Content,
-		MessageId: messageID,
-	}
-
-	action := &gen.ConversationAction{
-		Action: &gen.ConversationAction_UserMessageAction{
-			UserMessageAction: &gen.UserMessageAction{
-				UserMessage: userMessage,
+	if lastMsg.Role == "user" && lastMsg.Content != "" {
+		messageID, errID := newMessageID()
+		if errID != nil {
+			return nil, errID
+		}
+		action = &gen.ConversationAction{
+			Action: &gen.ConversationAction_UserMessageAction{
+				UserMessageAction: &gen.UserMessageAction{
+					UserMessage: &gen.UserMessage{
+						Text:      lastMsg.Content,
+						MessageId: messageID,
+					},
+				},
 			},
-		},
+		}
+		history = req.Messages[:lastIdx]
+	} else {
+		action = &gen.ConversationAction{
+			Action: &gen.ConversationAction_ResumeAction{
+				ResumeAction: &gen.ResumeAction{},
+			},
+		}
+		history = req.Messages
 	}
-
-	history := req.Messages[:lastUserIdx]
 
 	turns, err := buildHistoryTurnBlobIDs(history, blobs)
 	if err != nil {
@@ -702,15 +735,6 @@ func setFirstStringField(msg protoreflect.Message, value string) error {
 		}
 	}
 	return nil
-}
-
-func lastUserMessageIndex(messages []chatMessage) int {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			return i
-		}
-	}
-	return -1
 }
 
 func newMessageID() (string, error) {
