@@ -198,3 +198,48 @@ requires a real account and human judgment about response quality). Note
 the CLIProxyAPI version, plugin version, and date tested when you
 complete this checklist, and file any deviations as issues before
 considering the corresponding Acceptance Criteria item satisfied.
+
+## Real run log
+
+### 2026-08-19 — cmd/e2eprobe against api2.cursor.sh
+
+Ran via `cmd/e2eprobe` (see that command's doc comment): a standalone
+CLI that drives this plugin's actual production `internal/auth`,
+`internal/account`, `internal/executor`, and `internal/discovery` code
+directly against Cursor's real backend, without a full CLIProxyAPI host
+process — the same code paths the plugin uses when loaded by CLIProxyAPI,
+just invoked from a smaller harness.
+
+- **Login (Steps 1-2)**: `go run ./cmd/e2eprobe login` generated a real
+  PKCE login URL, completed in a real browser against a real Cursor
+  account, and `auth.Provider.PollLogin` correctly transitioned to
+  `success` against the real `api2.cursor.sh/auth/poll` endpoint.
+  Account id `cursor-a4b0dd41-34fa-4679-934b-a5f5d1be60d9`, token expiry
+  correctly parsed from the real JWT.
+- **Model discovery**: `go run ./cmd/e2eprobe models` returned the real,
+  account-specific model catalog via `GetUsableModels` (Claude Sonnet
+  4.5, GPT-5.4/5.1, Gemini 3.5 Flash, Kimi K3, GLM 5.2, and others) —
+  confirming `internal/discovery.Discoverer` normalizes a real response,
+  not a mocked one.
+- **Single-turn chat (Step 3)**: `go run ./cmd/e2eprobe chat "What model
+  are you, and what is 17 * 24? ..." gpt-5-mini` returned a real,
+  correct answer ("I'm GPT-5 Mini and 17 * 24 = 408.") in 4.34s through
+  `internal/executor.Executor.Execute`'s real bidirectional HTTP/2 Run
+  exchange.
+- **Multi-turn context (Step 3, `rootPromptMessagesJson` verification)**:
+  a 3-message conversation (user states a number, assistant
+  acknowledges, user asks for that number + 100 — all in one
+  `Execute` call, via a new `conv` probe command) returned "Your
+  favorite number plus 100 is 107." — correctly recalling the number
+  from turn 1, which was never repeated in turn 3's text. This is
+  concrete, real-backend evidence that `rootPromptMessagesJson`
+  (`internal/executor/translate_request.go`) genuinely reaches Cursor's
+  model prompt construction, not just that it is present on the wire
+  (which the mocked `TestBuildAgentRunRequest_RootPromptMessagesJson`
+  already proved at the encoding level).
+
+Not yet run in this pass: a native Cursor-tool-triggering conversation
+(Step 4's tool_calls / ExecServerMessage-decline paths) and a forced
+refresh failure (Step 5). Those remain open follow-up verification
+items; this entry covers login, discovery, and both single- and
+multi-turn chat translation against the real backend.
