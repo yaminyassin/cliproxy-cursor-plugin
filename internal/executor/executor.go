@@ -134,8 +134,13 @@ func (e *Executor) run(ctx context.Context, req pluginapi.ExecutorRequest) (chat
 		return chatCompletionsResponse{}, fmt.Errorf("cursor: executor requires an active account: %w", err)
 	}
 
-	blobs := newBlobStore()
-	agentRunReq, err := buildAgentRunRequest(chatReq, blobs)
+	// Reuse this conversation's blob cache and acknowledged state so
+	// Cursor can correlate turns and does not re-fetch the whole history's
+	// blobs every turn (see conversation.go).
+	conversationID := conversationIDFor(chatReq.Messages)
+	conversation := e.client.conversations.acquire(conversationID)
+	blobs := conversation.blobs
+	agentRunReq, err := buildAgentRunRequest(chatReq, blobs, conversationID, conversation.checkpoint)
 	if err != nil {
 		return chatCompletionsResponse{}, fmt.Errorf("cursor: failed to build agent run request: %w", err)
 	}
@@ -155,6 +160,7 @@ func (e *Executor) run(ctx context.Context, req pluginapi.ExecutorRequest) (chat
 	}
 
 	if streamResult != nil {
+		e.client.conversations.storeCheckpoint(conversationID, streamResult.checkpoint)
 		if errCaptured := acc.addCapturedToolRequests(streamResult.toolRequests, newClientToolIndex(chatReq.Tools)); errCaptured != nil {
 			return chatCompletionsResponse{}, errCaptured
 		}

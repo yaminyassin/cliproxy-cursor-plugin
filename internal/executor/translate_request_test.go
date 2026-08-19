@@ -32,7 +32,7 @@ func TestBuildAgentRunRequest_EncodesConversationHistoryAsBlobIDs(t *testing.T) 
 		},
 	}
 
-	agentReq, err := buildAgentRunRequest(req, blobs)
+	agentReq, err := buildAgentRunRequest(req, blobs, "conv-test", nil)
 	if err != nil {
 		t.Fatalf("buildAgentRunRequest failed: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestBuildAgentRunRequest_RootPromptMessagesJson(t *testing.T) {
 		},
 	}
 
-	agentReq, err := buildAgentRunRequest(req, blobs)
+	agentReq, err := buildAgentRunRequest(req, blobs, "conv-test", nil)
 	if err != nil {
 		t.Fatalf("buildAgentRunRequest failed: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestBuildAgentRunRequest_ToolResultRoundTrip(t *testing.T) {
 		},
 	}
 
-	agentReq, err := buildAgentRunRequest(req, blobs)
+	agentReq, err := buildAgentRunRequest(req, blobs, "conv-test", nil)
 	if err != nil {
 		t.Fatalf("buildAgentRunRequest failed: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestBuildAgentRunRequest_EncodesClientToolsAsMcpTools(t *testing.T) {
 		},
 	}
 
-	agentReq, err := buildAgentRunRequest(req, blobs)
+	agentReq, err := buildAgentRunRequest(req, blobs, "conv-test", nil)
 	if err != nil {
 		t.Fatalf("buildAgentRunRequest failed: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestBuildAgentRunRequest_NoTools_NoMcpTools(t *testing.T) {
 		Messages: []chatMessage{{Role: "user", Content: "hello"}},
 	}
 
-	agentReq, err := buildAgentRunRequest(req, blobs)
+	agentReq, err := buildAgentRunRequest(req, blobs, "conv-test", nil)
 	if err != nil {
 		t.Fatalf("buildAgentRunRequest failed: %v", err)
 	}
@@ -342,7 +342,7 @@ func TestBuildAgentRunRequest_ToolsPresent_AppendsNativeToolsOnlySystemPrompt(t 
 		},
 	}
 
-	agentReq, err := buildAgentRunRequest(req, blobs)
+	agentReq, err := buildAgentRunRequest(req, blobs, "conv-test", nil)
 	if err != nil {
 		t.Fatalf("buildAgentRunRequest failed: %v", err)
 	}
@@ -383,7 +383,7 @@ func TestBuildAgentRunRequest_ToolsPresent_SkipsDuplicateInstructionIfClientAlre
 		},
 	}
 
-	agentReq, err := buildAgentRunRequest(req, blobs)
+	agentReq, err := buildAgentRunRequest(req, blobs, "conv-test", nil)
 	if err != nil {
 		t.Fatalf("buildAgentRunRequest failed: %v", err)
 	}

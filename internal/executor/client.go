@@ -103,6 +103,10 @@ type AgentClient struct {
 	// finish while a hung stream still fails promptly.
 	streamClient *http.Client
 	baseURL      string
+
+	// conversations reuses per-conversation blobs and acknowledged state
+	// across turns so Cursor can correlate them (see conversation.go).
+	conversations *conversationCache
 }
 
 // NewAgentClient builds an AgentClient pointed at Cursor's real backend.
@@ -141,6 +145,7 @@ func NewAgentClient(accounts *account.Store, httpClient *http.Client, baseURL, c
 		httpClient:    versioned,
 		streamClient:  streaming,
 		baseURL:       baseURL,
+		conversations: newConversationCache(),
 	}
 }
 

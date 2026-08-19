@@ -96,6 +96,9 @@ type runStreamResult struct {
 	// and the client receives an undispatchable "mcp_tool_call" with only
 	// a rejection payload (observed live on 2026-08-19).
 	toolRequests []capturedToolRequest
+	// checkpoint is the latest ConversationStateStructure Cursor
+	// acknowledged during this exchange, cached for the next turn.
+	checkpoint *gen.ConversationStateStructure
 }
 
 // capturedToolRequest is one client-declared tool invocation Cursor
@@ -397,8 +400,15 @@ func (c *AgentClient) runCursorStreamOnce(ctx context.Context, baseURL, accessTo
 				if errExec := handleExecServerMessage(msg.ExecServerMessage, kv, result); errExec != nil {
 					return result, fmt.Errorf("cursor: failed to answer exec message: %w", errExec)
 				}
+			case *gen.AgentServerMessage_ConversationCheckpointUpdate:
+				// Cursor's acknowledged conversation state; cached so the
+				// next turn builds on it instead of resetting Cursor's
+				// accumulated non-history state (see conversation.go).
+				if cp := msg.ConversationCheckpointUpdate; cp != nil {
+					result.checkpoint = cp
+				}
 			default:
-				// ConversationCheckpointUpdate/ExecServerControlMessage/
+				// ExecServerControlMessage/
 				// InteractionQuery: non-chat agent bookkeeping, safely
 				// ignored per the plan's documented scope boundary -
 				// these do not require a synchronous reply to avoid

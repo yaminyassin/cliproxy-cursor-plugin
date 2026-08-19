@@ -56,7 +56,7 @@ const nativeToolsOnlyMcpSystemPrompt = "Every tool you call is executed by the u
 // blobStore (via blobs.put) BEFORE the Run request is sent, so an
 // eventual server-initiated getBlobArgs for that ID can be answered
 // immediately without a round trip - see stream.go's handleKvServerMessage.
-func buildAgentRunRequest(req chatCompletionsRequest, blobs *blobStore) (*gen.AgentRunRequest, error) {
+func buildAgentRunRequest(req chatCompletionsRequest, blobs *blobStore, conversationID string, base *gen.ConversationStateStructure) (*gen.AgentRunRequest, error) {
 	if len(req.Messages) == 0 {
 		return nil, fmt.Errorf("cursor: at least one message is required")
 	}
@@ -101,15 +101,31 @@ func buildAgentRunRequest(req chatCompletionsRequest, blobs *blobStore) (*gen.Ag
 		return nil, fmt.Errorf("cursor: failed to encode client tool definitions: %w", err)
 	}
 
-	return &gen.AgentRunRequest{
-		ConversationState: &gen.ConversationStateStructure{
-			Turns:                  turns,
-			RootPromptMessagesJson: rootPromptIDs,
-		},
-		Action:       action,
-		ModelDetails: &gen.ModelDetails{ModelId: req.Model},
-		McpTools:     mcpTools,
-	}, nil
+	// Build on the last state Cursor acknowledged for this conversation
+	// when we have one, so non-history state it accumulated (todos,
+	// pending tool calls, file state, summaries) survives instead of being
+	// reset every turn; only the history fields are replaced with our own
+	// encoding. Without a checkpoint this starts from an empty state, as
+	// before.
+	state := &gen.ConversationStateStructure{}
+	if base != nil {
+		if cloned, ok := proto.Clone(base).(*gen.ConversationStateStructure); ok {
+			state = cloned
+		}
+	}
+	state.Turns = turns
+	state.RootPromptMessagesJson = rootPromptIDs
+
+	runReq := &gen.AgentRunRequest{
+		ConversationState: state,
+		Action:            action,
+		ModelDetails:      &gen.ModelDetails{ModelId: req.Model},
+		McpTools:          mcpTools,
+	}
+	if conversationID != "" {
+		runReq.ConversationId = &conversationID
+	}
+	return runReq, nil
 }
 
 // buildMcpTools translates a client-supplied OpenAI-style tools[] array
