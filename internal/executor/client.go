@@ -90,7 +90,19 @@ type AgentClient struct {
 	clientVersion *atomic.Value
 
 	httpClient *http.Client
-	baseURL    string
+	// streamClient shares httpClient's transport (so connection pooling
+	// and headers are identical) but carries NO total Timeout.
+	//
+	// http.Client.Timeout covers the WHOLE request including reading the
+	// response body, so a 60s total timeout silently killed any Cursor
+	// turn that ran longer than a minute - and CLIProxyAPI then retried,
+	// producing the exactly-2m0s requests observed live on 2026-08-19. A
+	// total deadline is simply the wrong tool for a long-lived duplex
+	// stream; runCursorStreamOnce instead enforces a generous overall
+	// cap plus an idle timeout, so a genuinely long turn is allowed to
+	// finish while a hung stream still fails promptly.
+	streamClient *http.Client
+	baseURL      string
 }
 
 // NewAgentClient builds an AgentClient pointed at Cursor's real backend.
@@ -120,11 +132,14 @@ func NewAgentClient(accounts *account.Store, httpClient *http.Client, baseURL, c
 		},
 	}
 
+	streaming := &http.Client{Transport: versioned.Transport} // no total Timeout, see field doc
+
 	return &AgentClient{
 		Service:       genconnect.NewAgentServiceClient(versioned, baseURL),
 		Accounts:      accounts,
 		clientVersion: versionHolder,
 		httpClient:    versioned,
+		streamClient:  streaming,
 		baseURL:       baseURL,
 	}
 }

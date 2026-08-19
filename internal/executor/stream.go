@@ -109,6 +109,21 @@ type capturedToolRequest struct {
 // re-attempted after a retryable connection-level failure.
 const maxStreamAttempts = 3
 
+// Deadlines for one Run exchange. These replace a blanket
+// http.Client.Timeout, which covered the whole request INCLUDING the body
+// read and therefore killed any turn longer than its value mid-stream
+// (observed live on 2026-08-19 as exactly-2m0s requests once CLIProxyAPI
+// retried the truncated turn).
+//
+// streamIdleTimeout is the real health signal for a duplex stream: a turn
+// may legitimately run for minutes while Cursor works, but it should
+// always be producing *something* periodically. No bytes at all for this
+// long means the exchange is hung, not busy.
+const (
+	streamIdleTimeout = 90 * time.Second
+	streamMaxDuration = 10 * time.Minute
+)
+
 // runCursorStream performs the Run exchange, transparently re-attempting
 // it when the connection dies in a way that produced no content yet.
 //
@@ -216,6 +231,15 @@ func (c *AgentClient) runCursorStreamOnce(ctx context.Context, baseURL, accessTo
 		return nil, fmt.Errorf("cursor: failed to marshal initial run request: %w", err)
 	}
 
+	// Overall cap plus an idle watchdog, in place of a total client
+	// timeout (see streamIdleTimeout/streamMaxDuration). The idle timer is
+	// reset on every read that yields bytes, so a long-but-progressing
+	// turn survives while a silent stream is aborted promptly.
+	ctx, cancelStream := context.WithTimeout(ctx, streamMaxDuration)
+	defer cancelStream()
+	idleTimer := time.AfterFunc(streamIdleTimeout, cancelStream)
+	defer idleTimer.Stop()
+
 	pr, pw := io.Pipe()
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+runProcedurePath, pr)
 	if err != nil {
@@ -271,7 +295,7 @@ func (c *AgentClient) runCursorStreamOnce(ctx context.Context, baseURL, accessTo
 	defer pr.Close()
 	defer close(release)
 
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.streamClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("cursor: streaming run request failed: %w", err)
 	}
@@ -289,6 +313,8 @@ func (c *AgentClient) runCursorStreamOnce(ctx context.Context, baseURL, accessTo
 	for {
 		n, errRead := resp.Body.Read(buf)
 		if n > 0 {
+			// Progress: the stream is alive, so restart the idle watchdog.
+			idleTimer.Reset(streamIdleTimeout)
 			pending.Write(buf[:n])
 		}
 
