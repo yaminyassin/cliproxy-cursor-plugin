@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -319,7 +320,14 @@ func TestExecute_AnswersServerInitiatedBlobRequest(t *testing.T) {
 // TestResponseAccumulator_BatchesMultipleToolCallsIntoOneArray directly
 // exercises the per-turn accumulator (Architect Finding 3): several
 // ToolCallCompleted updates within one turn must flush as a single
-// tool_calls array, not one response per event.
+// tool_calls array, not one response per event. CallId is set on the
+// input fixtures to prove batching/ordering is independent of Cursor's
+// raw call_id value: toChatToolCall now always generates a fresh,
+// clean, OpenAI-compatible id (see translate_response.go's 2026-08-19
+// live-E2E-driven fix - a real run observed Cursor sending a call_id
+// containing an embedded newline), so this test asserts on the
+// generated ids' shape/uniqueness/order, not on the raw CallId being
+// echoed through.
 func TestResponseAccumulator_BatchesMultipleToolCallsIntoOneArray(t *testing.T) {
 	var acc responseAccumulator
 	acc.accumulate(&gen.InteractionUpdate{
@@ -344,8 +352,17 @@ func TestResponseAccumulator_BatchesMultipleToolCallsIntoOneArray(t *testing.T) 
 	if len(toolCalls) != 2 {
 		t.Fatalf("expected 2 batched tool calls in one array, got %d", len(toolCalls))
 	}
-	if toolCalls[0].ID != "call-a" || toolCalls[1].ID != "call-b" {
-		t.Errorf("unexpected tool call ids/order: %+v", toolCalls)
+	if toolCalls[0].Function.Name != "ls_tool_call" || toolCalls[1].Function.Name != "grep_tool_call" {
+		t.Errorf("unexpected tool call order/content: %+v", toolCalls)
+	}
+	if toolCalls[0].ID == "" || toolCalls[1].ID == "" {
+		t.Errorf("expected every tool call to have a generated, non-empty id, got %+v", toolCalls)
+	}
+	if toolCalls[0].ID == toolCalls[1].ID {
+		t.Errorf("expected distinct generated ids for the two batched tool calls, both were %q", toolCalls[0].ID)
+	}
+	if strings.ContainsAny(toolCalls[0].ID, "\n\r\t ") || strings.ContainsAny(toolCalls[1].ID, "\n\r\t ") {
+		t.Errorf("expected clean whitespace-free OpenAI-compatible tool call ids, got %+v", toolCalls)
 	}
 	if resp.Choices[0].FinishReason != "tool_calls" {
 		t.Errorf("finish_reason = %q, want tool_calls", resp.Choices[0].FinishReason)

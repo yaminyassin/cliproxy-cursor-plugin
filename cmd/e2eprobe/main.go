@@ -10,6 +10,8 @@
 //
 //	go run ./cmd/e2eprobe login
 //	go run ./cmd/e2eprobe chat "your message here"
+//	go run ./cmd/e2eprobe conv [model-id]
+//	go run ./cmd/e2eprobe tool [model-id]
 //	go run ./cmd/e2eprobe models
 //
 // login blocks in a single process until the browser login completes or
@@ -85,6 +87,12 @@ func main() {
 			model = os.Args[2]
 		}
 		cmdConv(ctx, exec, accounts, model)
+	case "tool":
+		model := ""
+		if len(os.Args) >= 3 {
+			model = os.Args[2]
+		}
+		cmdTool(ctx, exec, accounts, model)
 	case "models":
 		cmdModels(ctx, disc, accounts)
 	default:
@@ -248,6 +256,91 @@ func cmdConv(ctx context.Context, exec *executor.Executor, accounts *account.Sto
 	fmt.Println(string(resp.Payload))
 	fmt.Println()
 	fmt.Println("If the response correctly says 107 (or otherwise references 7 from turn 1), rootPromptMessagesJson genuinely reached Cursor's model prompt construction within this single request.")
+}
+
+// cmdTool sends a message that naturally prompts Cursor's model to
+// request a native tool (e.g. listing/reading files) and prints whether
+// the response surfaced a chat-completions tool_calls entry, per
+// fact-r5-tool-roundtrip: this plugin must surface the tool request to
+// the local client (as tool_calls), never execute it in-plugin itself.
+// This is the one Acceptance Criteria path the mocked tests
+// (TestExecute_SingleToolCallRoundTrip et al.) can only prove at the
+// translation-logic level, not against Cursor's real tool-triggering
+// behavior end to end.
+func cmdTool(ctx context.Context, exec *executor.Executor, accounts *account.Store, model string) {
+	st := requireLoggedIn()
+	restoreAccount(accounts, st)
+
+	if model == "" {
+		model = "gpt-5-mini"
+	}
+
+	message := "List the files in the current working directory using your shell/ls tool, then tell me how many there are."
+
+	payload := map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "user", "content": message},
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		fatalf("failed to marshal request: %v", err)
+	}
+
+	fmt.Printf("Sending to Cursor (model=%s): %q\n\n", model, message)
+	start := time.Now()
+	resp, err := exec.Execute(ctx, pluginapi.ExecutorRequest{
+		AuthID:  st.AuthID,
+		Model:   model,
+		Payload: raw,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		fatalf("Execute failed (real Cursor backend call): %v", err)
+	}
+
+	fmt.Printf("Response received in %s:\n\n", elapsed.Round(time.Millisecond))
+	fmt.Println(string(resp.Payload))
+	fmt.Println()
+
+	var decoded struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if errDecode := json.Unmarshal(resp.Payload, &decoded); errDecode != nil || len(decoded.Choices) == 0 {
+		fmt.Println("(could not decode response for tool_calls inspection)")
+		return
+	}
+
+	choice := decoded.Choices[0]
+	if len(choice.Message.ToolCalls) == 0 {
+		fmt.Println("No tool_calls in the response (Cursor answered in plain text this turn, or picked a different model behavior).")
+		fmt.Println("If this repeats, try re-running - tool invocation is model-decided, not deterministic per call.")
+		return
+	}
+
+	fmt.Printf("SUCCESS: Cursor requested %d native tool call(s), surfaced as chat-completions tool_calls (never executed in-plugin, per fact-r5-tool-roundtrip):\n\n", len(choice.Message.ToolCalls))
+	for i, tc := range choice.Message.ToolCalls {
+		fmt.Printf("  [%d] id=%s type=%s\n", i, tc.ID, tc.Type)
+		fmt.Printf("      function.name: %s\n", tc.Function.Name)
+		fmt.Printf("      function.arguments: %s\n", tc.Function.Arguments)
+	}
+	fmt.Printf("\nfinish_reason: %s (expected \"tool_calls\")\n", choice.FinishReason)
+	fmt.Println()
+	fmt.Println("This proves Cursor's real ExecServerMessage/InteractionUpdate.ToolCallCompleted path was translated into a standard chat-completions tool_calls entry against the live backend, not a mock.")
 }
 
 func requireLoggedIn() probeState {

@@ -38,7 +38,7 @@ func (a *responseAccumulator) accumulate(update *gen.InteractionUpdate) {
 		}
 	case *gen.InteractionUpdate_ToolCallCompleted:
 		if msg.ToolCallCompleted != nil {
-			tc, err := toChatToolCall(msg.ToolCallCompleted.GetCallId(), msg.ToolCallCompleted.GetToolCall())
+			tc, err := toChatToolCall(msg.ToolCallCompleted.GetToolCall())
 			if err != nil {
 				a.err = fmt.Errorf("cursor: failed to translate tool call: %w", err)
 				return
@@ -106,7 +106,7 @@ func (a *responseAccumulator) toChatCompletionsResponse(model, responseID string
 // - this is a faithful, generic representation of "whichever tool Cursor
 // asked for" without needing per-tool-type Go structs on the
 // chat-completions side.
-func toChatToolCall(callID string, toolCall *gen.ToolCall) (*chatToolCall, error) {
+func toChatToolCall(toolCall *gen.ToolCall) (*chatToolCall, error) {
 	if toolCall == nil {
 		return nil, nil
 	}
@@ -132,13 +132,24 @@ func toChatToolCall(callID string, toolCall *gen.ToolCall) (*chatToolCall, error
 		return nil, fmt.Errorf("cursor: failed to marshal tool call args for %s: %w", whichField.Name(), err)
 	}
 
-	if callID == "" {
-		generated, errID := newMessageID()
-		if errID != nil {
-			return nil, errID
-		}
-		callID = "call_" + generated
+	// The chat-completions-facing tool_calls[].id is ALWAYS a
+	// freshly-generated clean opaque token (call_<hex>), never Cursor's
+	// own call_id passed through verbatim. A real live E2E run
+	// (2026-08-19) observed Cursor sending a call_id containing an
+	// embedded newline plus a second concatenated internal id (e.g.
+	// "call_xyz\nfc_0e03a4cd..."), which is not a clean OpenAI-compatible
+	// token. This plugin never sends the client-facing id back to
+	// Cursor (see translate_request.go's chatToolCallToToolCall*, which
+	// reconstructs the Cursor ToolCall from Function.Name/Arguments
+	// only, not from ID), so generating a fresh id independent of
+	// Cursor's raw value is always safe and keeps the OpenAI-compatible
+	// surface contract (a clean, whitespace-free opaque string)
+	// regardless of what Cursor's backend sends internally.
+	generated, errID := newMessageID()
+	if errID != nil {
+		return nil, errID
 	}
+	callID := "call_" + generated
 
 	return &chatToolCall{
 		ID:   callID,

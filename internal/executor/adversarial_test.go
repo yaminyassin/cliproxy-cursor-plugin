@@ -16,7 +16,7 @@ func TestToChatToolCall_EmptyToolCall_NoPanic(t *testing.T) {
 			t.Fatalf("toChatToolCall panicked on an empty ToolCall: %v", r)
 		}
 	}()
-	tc, err := toChatToolCall("call-1", &gen.ToolCall{})
+	tc, err := toChatToolCall(&gen.ToolCall{})
 	if err == nil {
 		t.Errorf("expected an error for a ToolCall with no populated variant, got tc=%+v", tc)
 	}
@@ -29,7 +29,7 @@ func TestToChatToolCall_NilToolCall_NoPanic(t *testing.T) {
 			t.Fatalf("toChatToolCall panicked on a nil ToolCall: %v", r)
 		}
 	}()
-	tc, err := toChatToolCall("call-1", nil)
+	tc, err := toChatToolCall(nil)
 	if err != nil {
 		t.Errorf("expected nil,nil for a nil ToolCall, got err=%v", err)
 	}
