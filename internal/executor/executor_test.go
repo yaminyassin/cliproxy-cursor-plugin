@@ -51,9 +51,21 @@ type fakeCursorRunServer struct {
 	// can assert the second attempt reached it.
 	attemptMu sync.Mutex
 	attempts  int
+
+	// holdOpen delays the scripted updates so the heartbeat ticker has
+	// time to fire, and heartbeats counts ClientHeartbeat frames the
+	// server received on the request body.
+	holdOpen   time.Duration
+	heartbeats int
 }
 
 // connectionAttempts reports how many requests the server has seen.
+func (f *fakeCursorRunServer) heartbeatCount() int {
+	f.attemptMu.Lock()
+	defer f.attemptMu.Unlock()
+	return f.heartbeats
+}
+
 func (f *fakeCursorRunServer) connectionAttempts() int {
 	f.attemptMu.Lock()
 	defer f.attemptMu.Unlock()
@@ -151,6 +163,30 @@ func (f *fakeCursorRunServer) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.receivedExecReplies = append(f.receivedExecReplies, respFrame)
+	}
+
+	if f.holdOpen > 0 {
+		// Drain client frames (heartbeats) while deliberately keeping the
+		// turn open, mirroring a slow Cursor turn.
+		drainDone := make(chan struct{})
+		go func() {
+			defer close(drainDone)
+			for {
+				frame, err := readOneFrame(r.Body)
+				if err != nil {
+					return
+				}
+				var clientMsg gen.AgentClientMessage
+				if proto.Unmarshal(frame, &clientMsg) == nil {
+					if clientMsg.GetClientHeartbeat() != nil {
+						f.attemptMu.Lock()
+						f.heartbeats++
+						f.attemptMu.Unlock()
+					}
+				}
+			}
+		}()
+		time.Sleep(f.holdOpen)
 	}
 
 	for _, update := range f.scriptedUpdates {

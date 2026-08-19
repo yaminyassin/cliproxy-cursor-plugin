@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -122,6 +123,13 @@ const maxStreamAttempts = 3
 const (
 	streamIdleTimeout = 90 * time.Second
 	streamMaxDuration = 10 * time.Minute
+
+	// clientHeartbeatInterval matches gajae-code's own
+	// setInterval(sendHeartbeat, 5000) in streamCursor. Cursor expects the
+	// client to heartbeat for the whole duration of a Run exchange;
+	// without it Cursor stalls the turn until its own server-side timeout
+	// (observed live 2026-08-19 as requests pinned at exactly 2m0s).
+	clientHeartbeatInterval = 5 * time.Second
 )
 
 // runCursorStream performs the Run exchange, transparently re-attempting
@@ -255,6 +263,29 @@ func (c *AgentClient) runCursorStreamOnce(ctx context.Context, baseURL, accessTo
 	httpReq.Header.Set("x-request-id", newRequestID())
 
 	kv := &kvWriter{pw: pw}
+
+	// Heartbeat for the whole exchange (see clientHeartbeatInterval). The
+	// ticker goroutine exits with the call, and kv.close() below makes a
+	// late tick a no-op instead of a write into a torn-down pipe.
+	heartbeatDone := make(chan struct{})
+	defer close(heartbeatDone)
+	defer kv.close()
+	go func() {
+		ticker := time.NewTicker(clientHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatDone:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := kv.sendClientHeartbeat(); err != nil {
+					return
+				}
+			}
+		}
+	}()
 
 	// release is closed by this function's own defer on every exit
 	// path, telling the writer goroutine it may stop waiting and close
@@ -420,19 +451,31 @@ func extractFrame(buf *bytes.Buffer) (connectFrame, bool) {
 }
 
 // kvWriter serializes writes back onto the shared request-body pipe used
-// for the KV handshake, so concurrent handling never interleaves partial
+// for the KV handshake, the exec-message handshake, and the periodic
+// client heartbeat, so concurrent writers never interleave partial
 // frames. lastWriteErr records the initial-write failure case so it is
 // not silently discarded even if the read loop observes a different
 // terminal condition first.
+//
+// The mutex is required, not defensive: the heartbeat ticker writes from
+// its own goroutine while the read loop writes KV/exec replies, and two
+// unsynchronized writes to the pipe would corrupt the framing.
 type kvWriter struct {
+	mu           sync.Mutex
 	pw           *io.PipeWriter
+	closed       bool
 	lastWriteErr error
 }
 
 func (k *kvWriter) write(clientMsg *gen.AgentClientMessage) error {
 	raw, err := proto.Marshal(clientMsg)
 	if err != nil {
-		return fmt.Errorf("cursor: failed to marshal KV client message: %w", err)
+		return fmt.Errorf("cursor: failed to marshal client message: %w", err)
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.closed {
+		return fmt.Errorf("cursor: stream writer is closed")
 	}
 	_, err = k.pw.Write(frameConnectMessage(raw, 0))
 	if err != nil {
@@ -441,8 +484,32 @@ func (k *kvWriter) write(clientMsg *gen.AgentClientMessage) error {
 	return err
 }
 
+// close marks the writer unusable so a late heartbeat tick can never
+// write into a torn-down exchange.
+func (k *kvWriter) close() {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.closed = true
+}
+
 func (k *kvWriter) recordWriteErr(err error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	k.lastWriteErr = err
+}
+
+// sendClientHeartbeat writes one ClientHeartbeat frame on the open
+// stream. Cursor expects the client to heartbeat for the whole duration
+// of a Run exchange (gajae-code does this on a 5s interval in
+// streamCursor); without it Cursor stalls the turn until its own
+// server-side timeout, which showed up live on 2026-08-19 as requests
+// pinned at exactly 2m0s before returning or being abandoned.
+func (k *kvWriter) sendClientHeartbeat() error {
+	return k.write(&gen.AgentClientMessage{
+		Message: &gen.AgentClientMessage_ClientHeartbeat{
+			ClientHeartbeat: &gen.ClientHeartbeat{},
+		},
+	})
 }
 
 // handleKvServerMessage answers a server-initiated getBlobArgs/

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/cliproxy-cursor-plugin/internal/cursorpb/gen"
 )
@@ -149,5 +150,40 @@ func TestRunCursorStream_DoesNotRetryNonRetryableError(t *testing.T) {
 	}
 	if flaky.callCount() != 1 {
 		t.Errorf("expected exactly 1 attempt for a non-retryable error, got %d", flaky.callCount())
+	}
+}
+
+// TestRunCursorStream_SendsClientHeartbeats verifies the client heartbeat
+// is actually written for the duration of a slow turn. Cursor expects it
+// (gajae-code heartbeats every 5s in streamCursor); without it Cursor
+// stalls the turn until its own server-side timeout, which appeared live
+// on 2026-08-19 as requests pinned at exactly 2m0s.
+func TestRunCursorStream_SendsClientHeartbeats(t *testing.T) {
+	fake := newFakeCursorRunServer(t)
+	// Hold the turn open longer than two heartbeat intervals.
+	fake.holdOpen = clientHeartbeatInterval*2 + 500*time.Millisecond
+	fake.scriptedUpdates = []*gen.InteractionUpdate{
+		{Message: &gen.InteractionUpdate_TextDelta{TextDelta: &gen.TextDeltaUpdate{Text: "slow turn done"}}},
+		{Message: &gen.InteractionUpdate_TurnEnded{TurnEnded: &gen.TurnEndedUpdate{}}},
+	}
+
+	client := testAgentClient(fake, activeAccountStore())
+	runReq := &gen.AgentRunRequest{
+		Action: &gen.ConversationAction{
+			Action: &gen.ConversationAction_UserMessageAction{
+				UserMessageAction: &gen.UserMessageAction{UserMessage: &gen.UserMessage{Text: "hi"}},
+			},
+		},
+	}
+
+	result, err := client.runCursorStream(context.Background(), fake.server.URL, "test-token", runReq, newBlobStore())
+	if err != nil {
+		t.Fatalf("slow turn failed: %v", err)
+	}
+	if result == nil || len(result.updates) == 0 {
+		t.Fatalf("expected the slow turn to still complete, got %+v", result)
+	}
+	if got := fake.heartbeatCount(); got < 2 {
+		t.Errorf("expected at least 2 client heartbeats during a %s turn, got %d", fake.holdOpen, got)
 	}
 }
