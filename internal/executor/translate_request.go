@@ -434,6 +434,7 @@ func buildToolCallFromNameAndArgs(fieldName, argsJSON, resultContent string) (*g
 		return nil, fmt.Errorf("cursor: ToolCall descriptor missing expected 'tool' oneof")
 	}
 
+	mappedFromClientTool := false
 	fieldDesc := oneofDesc.Fields().ByName(protoreflect.Name(fieldName))
 	if fieldDesc == nil {
 		// The client may be returning a result for a NATIVE Cursor tool
@@ -445,6 +446,7 @@ func buildToolCallFromNameAndArgs(fieldName, argsJSON, resultContent string) (*g
 		if nativeField, mapped := resolveCursorToolField(fieldName); mapped {
 			if nativeDesc := oneofDesc.Fields().ByName(protoreflect.Name(nativeField)); nativeDesc != nil && nativeDesc.Message() != nil {
 				fieldDesc = nativeDesc
+				mappedFromClientTool = true
 			}
 		}
 	}
@@ -466,7 +468,7 @@ func buildToolCallFromNameAndArgs(fieldName, argsJSON, resultContent string) (*g
 
 	concreteMsg := reflectMsg.NewField(fieldDesc).Message()
 	if argsJSON != "" {
-		if err := protojson.Unmarshal([]byte(argsJSON), concreteMsg.Interface()); err != nil {
+		if err := applyToolCallArgs(concreteMsg, argsJSON, mappedFromClientTool); err != nil {
 			return nil, fmt.Errorf("cursor: failed to unmarshal tool call arguments for %s: %w", fieldName, err)
 		}
 	}
@@ -683,4 +685,46 @@ func newMessageID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// applyToolCallArgs writes client-supplied arguments onto a Cursor tool
+// call message.
+//
+// Two things make this deliberately forgiving:
+//
+//   - When the name was mapped from a CLIENT tool onto a Cursor native
+//     variant (see toolmap.go), the client's arguments describe the tool's
+//     parameters directly (e.g. {"path":"go.mod"}), whereas Cursor nests
+//     them one level down in an `args` message. Applying them at the top
+//     level fails, so they are written into `args` when that field exists.
+//   - DiscardUnknown is set. The mapping is a heuristic on tool NAMES, so a
+//     client's parameter names need not match Cursor's. An unrecognized
+//     parameter must not fail the whole request: a live run on 2026-08-19
+//     showed such a failure returning 500, which made CLIProxyAPI fuse the
+//     plugin and every later request fail with auth_unavailable. Dropping
+//     the unknown parameter degrades one argument; failing the request
+//     took down the provider.
+func applyToolCallArgs(concreteMsg protoreflect.Message, argsJSON string, mappedFromClientTool bool) error {
+	opts := protojson.UnmarshalOptions{DiscardUnknown: true}
+
+	if mappedFromClientTool {
+		if argsField := concreteMsg.Descriptor().Fields().ByName("args"); argsField != nil && argsField.Message() != nil {
+			sub := concreteMsg.NewField(argsField).Message()
+			if err := opts.Unmarshal([]byte(argsJSON), sub.Interface()); err != nil {
+				// Shapes did not line up; leave args unset rather than
+				// failing the turn. The tool identity still round-trips.
+				return nil
+			}
+			concreteMsg.Set(argsField, protoreflect.ValueOfMessage(sub))
+			return nil
+		}
+	}
+
+	if err := opts.Unmarshal([]byte(argsJSON), concreteMsg.Interface()); err != nil {
+		if mappedFromClientTool {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
