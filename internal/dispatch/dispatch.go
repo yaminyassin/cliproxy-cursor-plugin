@@ -25,10 +25,15 @@ import (
 
 const pluginIdentifier = "cursor"
 
+const (
+	cursorLogoURL       = "https://cursor.com/marketing-static/favicon-light.svg"
+	pluginRepositoryURL = "https://github.com/yaminyassin/cliproxy-cursor-plugin"
+)
+
 // version is the plugin release version reported in Metadata and used to
 // derive the semantic-versioning stance from the ralplan-approved plan:
 // bumped on any capability surface or wire-contract change.
-const version = "0.1.0"
+const version = "0.2.0"
 
 // accountStore, authProvider, agentClient, executorImpl, and discoverer
 // hold the plugin's process-lifetime state. A single dynamic-library
@@ -312,7 +317,8 @@ func currentRegistration() registration {
 			Name:             "cursor",
 			Version:          version,
 			Author:           "router-for-me",
-			GitHubRepository: "https://github.com/router-for-me/cliproxy-cursor-plugin",
+			GitHubRepository: pluginRepositoryURL,
+			Logo:             cursorLogoURL,
 			ConfigFields: []pluginapi.ConfigField{
 				{
 					Name:        "x_cursor_client_version",

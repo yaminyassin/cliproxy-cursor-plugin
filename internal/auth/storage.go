@@ -59,3 +59,18 @@ func (t TokenStorage) ExpiresAt() time.Time {
 	}
 	return parsed
 }
+
+// authMetadata exposes the current access token through the host's canonical
+// metadata field. CLIProxyAPI's management /api-call replaces $TOKEN$ from
+// metadata.access_token, which lets the management backend query Cursor's
+// account-scoped usage endpoint without returning the token to the browser.
+// Refresh material remains only in plugin-owned storage.
+func authMetadata(accessToken string, metadata map[string]any) map[string]any {
+	cloned := make(map[string]any, len(metadata)+2)
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	cloned["type"] = providerIdentifier
+	cloned["access_token"] = accessToken
+	return cloned
+}

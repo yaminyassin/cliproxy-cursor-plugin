@@ -31,7 +31,7 @@ authenticated via your own Cursor account — no separate Cursor IDE session req
 ### 1. Build the plugin
 
 ```sh
-git clone https://github.com/Yeachan-Heo/cliproxy-cursor-plugin.git
+git clone https://github.com/yaminyassin/cliproxy-cursor-plugin.git
 cd cliproxy-cursor-plugin
 make build
 ```
@@ -116,6 +116,39 @@ curl http://127.0.0.1:8317/v1/models -H "Authorization: Bearer <your-cliproxyapi
 
 Models are discovered dynamically per-account via Cursor's real model catalog — you'll see
 whatever your specific Cursor plan actually has access to.
+
+### Query current Cursor usage through the management backend
+
+Cursor credentials expose only their current access token through CPA's canonical
+`metadata.access_token` field. This enables server-side `$TOKEN$` substitution without
+returning the token or refresh material to the dashboard:
+
+```sh
+curl -H "Authorization: Bearer <your-management-secret-key>" \
+  -H "Content-Type: application/json" \
+  http://127.0.0.1:8317/v0/management/api-call \
+  -d '{
+    "auth_index": "<cursor-auth-index>",
+    "method": "POST",
+    "url": "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+    "header": {
+      "Authorization": "Bearer $TOKEN$",
+      "Content-Type": "application/json",
+      "Connect-Protocol-Version": "1",
+      "x-cursor-client-type": "cli"
+    },
+    "data": "{}"
+  }'
+```
+
+The response includes the current billing window and plan usage fields such as total,
+included, remaining, and limit spend. Cursor's current dashboard maps
+`planUsage.autoPercentUsed` to **Cursor Models** and `planUsage.apiPercentUsed` to
+**Other Models**. This DashboardService RPC is used by Cursor's own clients but is not a
+documented public API, so its path or response schema may change.
+
+See the living [Cursor quota compatibility record](docs/cursor-quota-management-research.md)
+for primary-source links, field mappings, security boundaries, and the revalidation runbook.
 
 ### Send a chat request
 

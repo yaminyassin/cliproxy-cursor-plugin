@@ -63,6 +63,7 @@ func (p *Provider) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest) 
 		FileName:         req.FileName,
 		Label:            "Cursor",
 		StorageJSON:      req.RawJSON,
+		Metadata:         authMetadata(storage.AccessToken, nil),
 		NextRefreshAfter: storage.ExpiresAt(),
 	}
 
@@ -124,6 +125,7 @@ func (p *Provider) PollLogin(ctx context.Context, req pluginapi.AuthLoginPollReq
 		FileName:         accountID + ".json",
 		Label:            "Cursor",
 		StorageJSON:      storageJSON,
+		Metadata:         authMetadata(result.AccessToken, nil),
 		NextRefreshAfter: expiresAt,
 	}
 
@@ -177,7 +179,7 @@ func (p *Provider) RefreshAuth(ctx context.Context, req pluginapi.AuthRefreshReq
 		ID:               req.AuthID,
 		Label:            "Cursor",
 		StorageJSON:      storageJSON,
-		Metadata:         req.Metadata,
+		Metadata:         authMetadata(result.AccessToken, req.Metadata),
 		Attributes:       req.Attributes,
 		NextRefreshAfter: result.ExpiresAt,
 	}

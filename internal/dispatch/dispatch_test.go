@@ -41,6 +41,15 @@ func TestHandleMethod_PluginRegister_ReturnsValidCapabilities(t *testing.T) {
 		if reg.Metadata.Version == "" {
 			t.Errorf("%s: metadata.version must not be empty", method)
 		}
+		if reg.Metadata.Version != version {
+			t.Errorf("%s: metadata.version = %q, want %q", method, reg.Metadata.Version, version)
+		}
+		if reg.Metadata.Logo != cursorLogoURL {
+			t.Errorf("%s: metadata.logo = %q, want %q", method, reg.Metadata.Logo, cursorLogoURL)
+		}
+		if reg.Metadata.GitHubRepository != pluginRepositoryURL {
+			t.Errorf("%s: metadata.github_repository = %q, want %q", method, reg.Metadata.GitHubRepository, pluginRepositoryURL)
+		}
 
 		caps := reg.Capabilities
 		if !caps.AuthProvider {

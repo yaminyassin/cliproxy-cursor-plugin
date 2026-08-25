@@ -107,8 +107,10 @@ func newTestHTTPClient(mockServerURL string) *http.Client {
 func TestPollLogin_Success(t *testing.T) {
 	mock := newMockCursorServer()
 	defer mock.Close()
+	var accessToken string
 	mock.setPollBehavior(func(uuid, verifier string) (int, string) {
-		resp, _ := json.Marshal(cursorTokenResponse{AccessToken: fakeJWT(time.Now().Add(time.Hour)), RefreshToken: "refresh-abc"})
+		accessToken = fakeJWT(time.Now().Add(time.Hour))
+		resp, _ := json.Marshal(cursorTokenResponse{AccessToken: accessToken, RefreshToken: "refresh-abc"})
 		return http.StatusOK, string(resp)
 	})
 
@@ -135,6 +137,12 @@ func TestPollLogin_Success(t *testing.T) {
 	}
 	if pollResp.Auth.ID == "" || pollResp.Auth.ID == providerIdentifier {
 		t.Errorf("auth.ID = %q, want a fresh unique per-account id, not the fixed provider key", pollResp.Auth.ID)
+	}
+	if got := pollResp.Auth.Metadata["access_token"]; got != accessToken {
+		t.Errorf("auth metadata access_token = %#v, want current access token", got)
+	}
+	if _, exists := pollResp.Auth.Metadata["refresh_token"]; exists {
+		t.Error("auth metadata unexpectedly exposes refresh_token")
 	}
 
 	st, ok := accounts.Peek(pollResp.Auth.ID)
@@ -340,8 +348,9 @@ func TestPollLogin_Rejected(t *testing.T) {
 func TestRefreshAuth_Success(t *testing.T) {
 	mock := newMockCursorServer()
 	defer mock.Close()
+	newAccessToken := fakeJWT(time.Now().Add(time.Hour))
 	mock.setRefreshBehavior(func(bearer string) (int, string) {
-		resp, _ := json.Marshal(cursorRefreshResponse{AccessToken: fakeJWT(time.Now().Add(time.Hour)), RefreshToken: "new-refresh"})
+		resp, _ := json.Marshal(cursorRefreshResponse{AccessToken: newAccessToken, RefreshToken: "new-refresh"})
 		return http.StatusOK, string(resp)
 	})
 
@@ -354,6 +363,10 @@ func TestRefreshAuth_Success(t *testing.T) {
 	resp, err := provider.RefreshAuth(context.Background(), pluginapi.AuthRefreshRequest{
 		AuthID:      "cursor",
 		StorageJSON: storageJSON,
+		Metadata: map[string]any{
+			"custom":       "preserved",
+			"access_token": "stale-access",
+		},
 	})
 	if err != nil {
 		t.Fatalf("RefreshAuth failed: %v", err)
@@ -361,10 +374,48 @@ func TestRefreshAuth_Success(t *testing.T) {
 	if len(resp.Auth.StorageJSON) == 0 {
 		t.Errorf("expected non-empty refreshed StorageJSON")
 	}
+	if got := resp.Auth.Metadata["access_token"]; got != newAccessToken {
+		t.Errorf("refreshed metadata access_token = %#v, want new access token", got)
+	}
+	if got := resp.Auth.Metadata["custom"]; got != "preserved" {
+		t.Errorf("refreshed metadata custom = %#v, want preserved", got)
+	}
+	if _, exists := resp.Auth.Metadata["refresh_token"]; exists {
+		t.Error("refreshed metadata unexpectedly exposes refresh_token")
+	}
 
 	st, ok := accounts.Peek("cursor")
 	if !ok || st.Status != account.StatusActive {
 		t.Errorf("expected account marked active after successful refresh, got %+v (ok=%v)", st, ok)
+	}
+}
+
+func TestParseAuth_ExposesCurrentAccessTokenForManagementProxy(t *testing.T) {
+	accounts := account.NewStore()
+	provider := NewProvider(accounts, nil)
+	storage := NewTokenStorage("persisted-access", "persisted-refresh", time.Now().Add(time.Hour))
+	storageJSON, err := storage.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+
+	resp, err := provider.ParseAuth(context.Background(), pluginapi.AuthParseRequest{
+		FileName: "cursor-account.json",
+		RawJSON:  storageJSON,
+	})
+	if err != nil {
+		t.Fatalf("ParseAuth failed: %v", err)
+	}
+	if !resp.Handled {
+		t.Fatal("ParseAuth did not handle Cursor storage")
+	}
+	if got := resp.Auth.Metadata["access_token"]; got != "persisted-access" {
+		t.Errorf("metadata access_token = %#v, want persisted access token", got)
+	}
+	for _, key := range []string{"refresh_token", "expired"} {
+		if _, exists := resp.Auth.Metadata[key]; exists {
+			t.Errorf("metadata unexpectedly contains private storage field %q", key)
+		}
 	}
 }
 
