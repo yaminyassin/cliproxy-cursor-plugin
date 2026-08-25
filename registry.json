@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cursor",
+      "name": "Cursor Subscription Provider",
+      "description": "Adds Cursor subscription models, OAuth login, model discovery, and quota data to CLIProxyAPI.",
+      "author": "Yamin Yassin",
+      "version": "0.2.0",
+      "repository": "https://github.com/yaminyassin/cliproxy-cursor-plugin",
+      "logo": "https://cursor.com/marketing-static/favicon-light.svg",
+      "homepage": "https://github.com/yaminyassin/cliproxy-cursor-plugin",
+      "tags": ["Provider", "Cursor", "OAuth", "Quota"]
+    },
+    {
+      "id": "cliproxyapi-copilot",
+      "name": "GitHub Copilot Subscription Provider",
+      "description": "Maintained Copilot provider build with CPA quota-management metadata support.",
+      "author": "Arthur Sommer and Yamin Yassin",
+      "version": "0.3.5",
+      "repository": "https://github.com/yaminyassin/cliproxyapi-copilot-plugin",
+      "homepage": "https://github.com/yaminyassin/cliproxyapi-copilot-plugin",
+      "license": "MIT",
+      "tags": ["Provider", "GitHub Copilot", "OAuth", "Quota"]
+    }
+  ]
+}

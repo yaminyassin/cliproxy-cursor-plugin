@@ -14,6 +14,7 @@
 | Cursor dashboard bundle inspected | `3iat84zr3gtbx.js` |
 | Cursor plan validated | Individual Ultra |
 | Maintained plugin repository | [yaminyassin/cliproxy-cursor-plugin](https://github.com/yaminyassin/cliproxy-cursor-plugin) |
+| Durable CPA maintenance contract | [cpa-durable-maintenance.md](cpa-durable-maintenance.md) |
 | Maintained Management Center repository | [yaminyassin/Cli-Proxy-API-Management-Center](https://github.com/yaminyassin/Cli-Proxy-API-Management-Center) |
 | CPA SDK/API version pinned by this plugin | `v7.2.134` |
 | Live CPA build validated | `v7.2.140` via Homebrew |

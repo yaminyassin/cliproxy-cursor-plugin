@@ -30,10 +30,9 @@ const (
 	pluginRepositoryURL = "https://github.com/yaminyassin/cliproxy-cursor-plugin"
 )
 
-// version is the plugin release version reported in Metadata and used to
-// derive the semantic-versioning stance from the ralplan-approved plan:
-// bumped on any capability surface or wire-contract change.
-const version = "0.2.0"
+// version is the plugin release version reported in Metadata. Release builds
+// replace it through a linker flag so the Git tag and loaded plugin agree.
+var version = "0.2.0"
 
 // accountStore, authProvider, agentClient, executorImpl, and discoverer
 // hold the plugin's process-lifetime state. A single dynamic-library

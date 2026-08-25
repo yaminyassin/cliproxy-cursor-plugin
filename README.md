@@ -28,7 +28,34 @@ authenticated via your own Cursor account — no separate Cursor IDE session req
 
 ## Installation
 
-### 1. Build the plugin
+### Recommended: CPA plugin store
+
+This repository publishes the checksummed, platform-specific release archives expected by
+CPA's native plugin store. Add the maintained registry once:
+
+```yaml
+plugins:
+  enabled: true
+  store-sources:
+    - "https://raw.githubusercontent.com/yaminyassin/cliproxy-cursor-plugin/main/registry.json"
+```
+
+Restart CPA, open **Plugin Store** in the management center, choose the `cursor` entry from
+this custom source, and install the required release. CPA records the source and exact
+release in `plugins.configs.cursor.store` and installs a versioned binary under its
+platform directory. This is the recommended route because later CPA upgrades keep the
+configuration and plugin artifact outside the Homebrew package.
+
+The same registry exposes the maintained Copilot fork used by the quota dashboard. If the
+official and maintained Copilot entries both appear, select the entry whose repository is
+`yaminyassin/cliproxyapi-copilot-plugin`.
+
+See [Durable CPA maintenance](docs/cpa-durable-maintenance.md) for the release, upgrade,
+validation, and rollback contract.
+
+### Manual build
+
+#### 1. Build the plugin
 
 ```sh
 git clone https://github.com/yaminyassin/cliproxy-cursor-plugin.git
@@ -39,7 +66,7 @@ make build
 This produces a platform-appropriate shared library under `bin/`:
 `cursor.dylib` (macOS), `cursor.so` (Linux), or `cursor.dll` (Windows).
 
-### 2. Install it into CLIProxyAPI
+#### 2. Install it into CLIProxyAPI
 
 CLIProxyAPI loads plugins from its configured `plugins.dir` (default `plugins`) by filename.
 Copy the built binary there:
@@ -48,7 +75,7 @@ Copy the built binary there:
 cp bin/cursor.dylib /path/to/your/cliproxyapi/plugins/   # adjust extension for your platform
 ```
 
-### 3. Wire it into `config.yaml`
+#### 3. Wire it into `config.yaml`
 
 Merge this into your existing CLIProxyAPI `config.yaml` (see
 [`config/plugins-config-example.yaml`](config/plugins-config-example.yaml) for the annotated
@@ -66,7 +93,7 @@ plugins:
       # x_cursor_client_version: "cli-2026.02.13-41ac335"
 ```
 
-### 4. Start CLIProxyAPI
+#### 4. Start CLIProxyAPI
 
 ```sh
 ./cliproxy-api -config config.yaml
@@ -229,9 +256,11 @@ Cursor's protocol so the model can use it on the next turn.
 
 ```sh
 make build      # build the plugin
+make package    # build a CPA plugin-store release archive for the current platform
 make generate   # regenerate internal/cursorpb from the Cursor protobuf descriptor
 make clean      # remove build artifacts
 go test ./...   # run the full mocked unit test suite (no live Cursor account needed)
+./scripts/validate-registry.sh
 ```
 
 See [`internal/cursorpb/README.md`](internal/cursorpb/README.md) for how the Cursor protobuf

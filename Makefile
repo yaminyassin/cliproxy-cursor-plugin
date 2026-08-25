@@ -1,5 +1,7 @@
 PLUGIN_NAME := cursor
 BIN_DIR := $(CURDIR)/bin
+VERSION ?= 0.2.0
+VERSION_LDFLAG := -X github.com/router-for-me/cliproxy-cursor-plugin/internal/dispatch.version=$(VERSION)
 
 UNAME_S := $(shell uname -s)
 
@@ -11,12 +13,17 @@ else
 PLUGIN_EXT := so
 endif
 
-.PHONY: build list clean generate
+.PHONY: build list package clean generate
 
 # Mirrors CLIProxyAPI's own examples/plugin/Makefile convention:
 # a cgo c-shared build producing a platform-appropriate .so/.dylib/.dll
 # under bin/, loadable via plugins.configs in config.yaml.
 build: $(BIN_DIR)/$(PLUGIN_NAME).$(PLUGIN_EXT)
+
+package:
+	$(MAKE) clean
+	$(MAKE) build VERSION="$(VERSION)"
+	./scripts/package-release.sh "$(VERSION)"
 
 list:
 	@echo $(PLUGIN_NAME)
@@ -28,7 +35,7 @@ $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
 $(BIN_DIR)/$(PLUGIN_NAME).$(PLUGIN_EXT): cmd/plugin/main.go go.mod | $(BIN_DIR)
-	go build -buildmode=c-shared -o $(abspath $@) ./cmd/plugin
+	go build -buildvcs=false -trimpath -ldflags "$(VERSION_LDFLAG)" -buildmode=c-shared -o $(abspath $@) ./cmd/plugin
 	rm -f $(BIN_DIR)/$(PLUGIN_NAME).h
 
 # Regenerates internal/cursorpb/proto/agent.protoset from the sibling
